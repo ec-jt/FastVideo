@@ -61,14 +61,43 @@ class GemmaConnectorConfig:
 
 
 class GemmaFeaturesExtractorProjLinear(nn.Module):
-    """Linear projection that aggregates stacked Gemma hidden states."""
+    """Linear projection that aggregates stacked Gemma hidden states.
 
-    def __init__(self, in_features: int, out_features: int) -> None:
+    For LTX-2: single aggregate_embed for both video and audio.
+    For LTX-2.3: separate video_aggregate_embed and audio_aggregate_embed
+    with different output dimensions.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        audio_out_features: int | None = None,
+    ) -> None:
         super().__init__()
-        self.aggregate_embed = nn.Linear(in_features, out_features, bias=False)
+        if audio_out_features is not None:
+            # LTX-2.3: separate video and audio projections
+            self.video_aggregate_embed = nn.Linear(
+                in_features, out_features, bias=True
+            )
+            self.audio_aggregate_embed = nn.Linear(
+                in_features, audio_out_features, bias=True
+            )
+            self.aggregate_embed = None
+        else:
+            # LTX-2: single projection
+            self.aggregate_embed = nn.Linear(
+                in_features, out_features, bias=False
+            )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.aggregate_embed(x)
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.aggregate_embed is not None:
+            return self.aggregate_embed(x), None
+        video = self.video_aggregate_embed(x)
+        audio = self.audio_aggregate_embed(x)
+        return video, audio
 
 
 class _BasicTransformerBlock1D(nn.Module):
@@ -330,9 +359,17 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
         super().__init__(config)
         arch = config.arch_config
 
+        # LTX-2.3: compute audio feature extractor output size
+        audio_fe_out = None
+        audio_head_dim = getattr(arch, "audio_connector_attention_head_dim", None)
+        audio_num_heads = getattr(arch, "audio_connector_num_attention_heads", None)
+        if audio_head_dim is not None and audio_num_heads is not None:
+            audio_fe_out = audio_head_dim * audio_num_heads
+
         self.feature_extractor_linear = GemmaFeaturesExtractorProjLinear(
             in_features=arch.feature_extractor_in_features,
             out_features=arch.feature_extractor_out_features,
+            audio_out_features=audio_fe_out,
         )
 
         connector_config = GemmaConnectorConfig(
@@ -346,7 +383,24 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
             num_learnable_registers=arch.connector_num_learnable_registers,
         )
         self.embeddings_connector = Embeddings1DConnector(connector_config)
-        self.audio_embeddings_connector = Embeddings1DConnector(connector_config)
+
+        # LTX-2.3: audio connector may have different dimensions
+        audio_head_dim = getattr(arch, "audio_connector_attention_head_dim", None)
+        audio_num_heads = getattr(arch, "audio_connector_num_attention_heads", None)
+        if audio_head_dim is not None and audio_num_heads is not None:
+            audio_connector_config = GemmaConnectorConfig(
+                num_attention_heads=audio_num_heads,
+                attention_head_dim=audio_head_dim,
+                num_layers=arch.connector_num_layers,
+                positional_embedding_theta=arch.connector_positional_embedding_theta,
+                positional_embedding_max_pos=arch.connector_positional_embedding_max_pos,
+                rope_type=LTXRopeType(arch.connector_rope_type),
+                double_precision_rope=arch.connector_double_precision_rope,
+                num_learnable_registers=arch.connector_num_learnable_registers,
+            )
+        else:
+            audio_connector_config = connector_config
+        self.audio_embeddings_connector = Embeddings1DConnector(audio_connector_config)
 
         self.gemma_model_path = arch.gemma_model_path
         self.gemma_dtype = arch.gemma_dtype
@@ -411,9 +465,9 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
         normed_text_features = _norm_and_concat_padded_batch(
             encoded_text_features, sequence_lengths, padding_side=padding_side
         )
-        return self.feature_extractor_linear(
-            normed_text_features.to(encoded_text_features_dtype)
-        )
+        normed = normed_text_features.to(encoded_text_features_dtype)
+        video_features, audio_features = self.feature_extractor_linear(normed)
+        return video_features, audio_features
 
     def _convert_to_additive_mask(
         self, attention_mask: torch.Tensor, dtype: torch.dtype
@@ -426,6 +480,7 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
         self,
         encoded_input: torch.Tensor,
         attention_mask: torch.Tensor,
+        audio_encoded_input: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         connector_attention_mask = self._convert_to_additive_mask(
             attention_mask, encoded_input.dtype
@@ -442,8 +497,13 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
         )
         encoded = encoded * attention_mask
 
+        # LTX-2.3: use separate audio features if available
+        audio_input = audio_encoded_input if audio_encoded_input is not None else encoded_input
+        audio_connector_mask = self._convert_to_additive_mask(
+            attention_mask.squeeze(-1), audio_input.dtype
+        ) if audio_encoded_input is not None else connector_attention_mask
         encoded_for_audio, _ = self.audio_embeddings_connector(
-            encoded_input, connector_attention_mask
+            audio_input, audio_connector_mask
         )
 
         return encoded, encoded_for_audio, attention_mask.squeeze(-1)
@@ -529,7 +589,7 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
         )
         model.to(device=orig_device)
         
-        encoded_inputs = self._run_feature_extractor(
+        encoded_inputs, audio_encoded_inputs = self._run_feature_extractor(
             outputs.hidden_states,
             attention_mask,
             padding_side=self.padding_side,
@@ -541,7 +601,8 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
                 f"shape={tuple(encoded_inputs.shape)}"
             )
         video_encoding, audio_encoding, attention_mask = self._run_connectors(
-            encoded_inputs, attention_mask
+            encoded_inputs, attention_mask,
+            audio_encoded_input=audio_encoded_inputs,
         )
         if os.getenv("LTX2_PIPELINE_DEBUG_LOG", "0") == "1":
             _debug_log_line(
@@ -567,9 +628,19 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
     ) -> set[str]:
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # Key mappings for feature extractor weights
+        _FE_PREFIX = "feature_extractor_linear."
+        _KEY_MAP = {
+            # LTX-2 single aggregate embed
+            "aggregate_embed.weight": f"{_FE_PREFIX}aggregate_embed.weight",
+            # LTX-2.3 split video/audio aggregate embeds
+            "video_aggregate_embed.weight": f"{_FE_PREFIX}video_aggregate_embed.weight",
+            "video_aggregate_embed.bias": f"{_FE_PREFIX}video_aggregate_embed.bias",
+            "audio_aggregate_embed.weight": f"{_FE_PREFIX}audio_aggregate_embed.weight",
+            "audio_aggregate_embed.bias": f"{_FE_PREFIX}audio_aggregate_embed.bias",
+        }
         for name, loaded_weight in weights:
-            if name == "aggregate_embed.weight":
-                name = "feature_extractor_linear.aggregate_embed.weight"
+            name = _KEY_MAP.get(name, name)
             if name not in params_dict:
                 continue
             param = params_dict[name]

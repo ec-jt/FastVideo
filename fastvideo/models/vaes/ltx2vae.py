@@ -1163,17 +1163,21 @@ def _make_decoder_block(
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "compress_time":
+        out_channels = in_channels // block_config.get("multiplier", 1)
         block = DepthToSpaceUpsample(
             dims=convolution_dimensions,
             in_channels=in_channels,
             stride=(2, 1, 1),
+            out_channels_reduction_factor=block_config.get("multiplier", 1),
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "compress_space":
+        out_channels = in_channels // block_config.get("multiplier", 1)
         block = DepthToSpaceUpsample(
             dims=convolution_dimensions,
             in_channels=in_channels,
             stride=(1, 2, 2),
+            out_channels_reduction_factor=block_config.get("multiplier", 1),
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "compress_all":
@@ -1347,6 +1351,7 @@ class VideoDecoder(nn.Module):
         causal: bool = False,
         timestep_conditioning: bool = False,
         decoder_spatial_padding_mode: PaddingModeType = PaddingModeType.REFLECT,
+        base_channels: int | None = None,
     ):
         super().__init__()
 
@@ -1361,13 +1366,18 @@ class VideoDecoder(nn.Module):
         self.decode_noise_scale = 0.025
         self.decode_timestep = 0.05
 
-        feature_channels = in_channels
-        for block_name, block_params in list(reversed(decoder_blocks)):
-            block_config = block_params if isinstance(block_params, dict) else {}
-            if block_name == "res_x_y":
-                feature_channels = feature_channels * block_config.get("multiplier", 2)
-            if block_name == "compress_all":
-                feature_channels = feature_channels * block_config.get("multiplier", 1)
+        if base_channels is not None:
+            # LTX-2.3: use base_channels * 8 as initial feature channels
+            feature_channels = base_channels * 8
+        else:
+            # LTX-2: compute feature channels from block configs
+            feature_channels = in_channels
+            for block_name, block_params in list(reversed(decoder_blocks)):
+                block_config = block_params if isinstance(block_params, dict) else {}
+                if block_name == "res_x_y":
+                    feature_channels = feature_channels * block_config.get("multiplier", 2)
+                if block_name in ("compress_all", "compress_time", "compress_space"):
+                    feature_channels = feature_channels * block_config.get("multiplier", 1)
 
         self.conv_in = make_conv_nd(
             dims=convolution_dimensions,
@@ -1544,6 +1554,8 @@ class VideoDecoderConfigurator:
         norm_layer_str = config.get("norm_layer", "pixel_norm")
         causal = config.get("causal_decoder", False)
         timestep_conditioning = config.get("timestep_conditioning", True)
+        # LTX-2.3: decoder_base_channels for initial feature channel computation
+        decoder_base_channels = config.get("decoder_base_channels", None)
 
         return VideoDecoder(
             convolution_dimensions=convolution_dimensions,
@@ -1555,6 +1567,7 @@ class VideoDecoderConfigurator:
             causal=causal,
             timestep_conditioning=timestep_conditioning,
             decoder_spatial_padding_mode=decoder_spatial_padding_mode,
+            base_channels=decoder_base_channels,
         )
 
 

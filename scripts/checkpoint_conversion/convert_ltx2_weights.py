@@ -109,39 +109,96 @@ def _filter_transformer_config(config: dict) -> dict:
         "audio_cross_attention_dim",
         "audio_positional_embedding_max_pos",
         "av_ca_timestep_scale_multiplier",
+        # LTX-2.3 cross-attention AdaLN and gated attention
+        "cross_attention_adaln",
+        "apply_gated_attention",
+        "connector_apply_gated_attention",
     }
     filtered = {k: v for k, v in transformer.items() if k in allowed}
     if "frequencies_precision" in filtered:
         filtered["double_precision_rope"] = filtered["frequencies_precision"] == "float64"
         del filtered["frequencies_precision"]
+    # LTX-2.3: when caption_proj_before_connector is True, the transformer
+    # receives connector output directly, so caption_channels should match
+    # the connector output dimension (num_attention_heads * attention_head_dim)
+    if transformer.get("caption_proj_before_connector", False):
+        connector_heads = transformer.get("connector_num_attention_heads", 32)
+        connector_head_dim = transformer.get("connector_attention_head_dim", 128)
+        filtered["caption_channels"] = connector_heads * connector_head_dim
     return filtered
 
 
 def _build_text_embedding_projection_config(
     gemma_model_path: str = "",
+    metadata_config: dict | None = None,
 ) -> dict:
-    return {
+    # Extract connector parameters from metadata if available (LTX-2.3)
+    transformer = (metadata_config or {}).get("transformer", {})
+    connector_num_heads = transformer.get("connector_num_attention_heads", 30)
+    connector_head_dim = transformer.get("connector_attention_head_dim", 128)
+    connector_num_layers = transformer.get("connector_num_layers", 2)
+    connector_num_registers = transformer.get(
+        "connector_num_learnable_registers", 128
+    )
+    connector_norm_output = transformer.get("connector_norm_output", False)
+    connector_apply_gated = transformer.get(
+        "connector_apply_gated_attention", False
+    )
+    connector_registers_std = transformer.get(
+        "connector_learnable_registers_std", None
+    )
+    caption_proj_before_connector = transformer.get(
+        "caption_proj_before_connector", False
+    )
+    # Audio connector parameters (LTX-2.3)
+    audio_connector_head_dim = transformer.get(
+        "audio_connector_attention_head_dim", None
+    )
+    audio_connector_num_heads = transformer.get(
+        "audio_connector_num_attention_heads", None
+    )
+
+    hidden_size = connector_num_heads * connector_head_dim
+    # Gemma-3-12b hidden size is 3840 (used for feature extraction)
+    gemma_hidden_size = 3840
+    num_gemma_layers = 49  # number of hidden layers used for feature extraction
+
+    config = {
         "architectures": ["LTX2GemmaTextEncoderModel"],
-        "hidden_size": 3840,
+        "hidden_size": hidden_size,
         "num_hidden_layers": 48,
-        "num_attention_heads": 30,
+        "num_attention_heads": connector_num_heads,
         "text_len": 1024,
         "pad_token_id": 0,
         "eos_token_id": 2,
         "gemma_model_path": gemma_model_path,
         "gemma_dtype": "bfloat16",
         "padding_side": "left",
-        "feature_extractor_in_features": 3840 * 49,
-        "feature_extractor_out_features": 3840,
-        "connector_num_attention_heads": 30,
-        "connector_attention_head_dim": 128,
-        "connector_num_layers": 2,
+        "feature_extractor_in_features": gemma_hidden_size * num_gemma_layers,
+        "feature_extractor_out_features": hidden_size,
+        "connector_num_attention_heads": connector_num_heads,
+        "connector_attention_head_dim": connector_head_dim,
+        "connector_num_layers": connector_num_layers,
         "connector_positional_embedding_theta": 10000.0,
         "connector_positional_embedding_max_pos": [4096],
         "connector_rope_type": "split",
         "connector_double_precision_rope": True,
-        "connector_num_learnable_registers": 128,
+        "connector_num_learnable_registers": connector_num_registers,
     }
+    # LTX-2.3 specific fields
+    if connector_norm_output:
+        config["connector_norm_output"] = True
+    if connector_apply_gated:
+        config["connector_apply_gated_attention"] = True
+    if connector_registers_std is not None:
+        config["connector_learnable_registers_std"] = connector_registers_std
+    if caption_proj_before_connector:
+        config["caption_proj_before_connector"] = True
+    if audio_connector_head_dim is not None:
+        config["audio_connector_attention_head_dim"] = audio_connector_head_dim
+    if audio_connector_num_heads is not None:
+        config["audio_connector_num_attention_heads"] = audio_connector_num_heads
+    return config
 
 
 def _wrap_component_config(
@@ -279,7 +336,8 @@ def convert_components(
             class_name="LTX2Vocoder",
         ),
         "text_embedding_projection": _build_text_embedding_projection_config(
-            gemma_model_path=gemma_model_path
+            gemma_model_path=gemma_model_path,
+            metadata_config=metadata_config,
         ),
     }
 

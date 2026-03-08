@@ -68,6 +68,12 @@ class LTX2VideoArchConfig(DiTArchConfig):
         default_factory=lambda: [20])
     av_ca_timestep_scale_multiplier: int = 1
 
+    # LTX-2.3 cross-attention AdaLN (prompt conditioning)
+    cross_attention_adaln: bool = False
+    # LTX-2.3 gated attention (per-head output gating)
+    apply_gated_attention: bool = False
+    connector_apply_gated_attention: bool = False
+
     def __post_init__(self):
         super().__post_init__()
         patch_volume = self.patch_size[0] * self.patch_size[
