@@ -62,7 +62,9 @@ from fastvideo.configs.sample.hyworld import HYWorld_SamplingParam
 from fastvideo.configs.sample.hunyuangamecraft import HunyuanGameCraftSamplingParam
 from fastvideo.configs.sample.lingbotworld import LingBotWorld_SamplingParam
 from fastvideo.configs.sample.ltx2 import (LTX2BaseSamplingParam,
-                                           LTX2DistilledSamplingParam)
+                                           LTX2DistilledSamplingParam,
+                                           LTX23BaseSamplingParam,
+                                           LTX23DistilledSamplingParam)
 from fastvideo.configs.sample.turbodiffusion import (
     TurboDiffusionI2V_A14B_SamplingParam,
     TurboDiffusionT2V_14B_SamplingParam,
@@ -259,6 +261,32 @@ def _register_configs() -> None:
             "distilled" not in path.lower(),
         ],
     )
+    # LTX-2.3 (distilled) — must be registered before generic LTX-2
+    # distilled so the more-specific "2.3" detector wins.
+    # LTX-2.3 dev (non-distilled) one-stage pipeline
+    register_configs(
+        sampling_param_cls=LTX23BaseSamplingParam,
+        pipeline_config_cls=LTX2T2VConfig,
+        hf_model_paths=[
+            "FastVideo/LTX2.3-Dev-Diffusers",
+        ],
+        model_detectors=[
+            lambda path: "ltx2.3" in path.lower() and
+            "dev" in path.lower(),
+        ],
+    )
+
+    register_configs(
+        sampling_param_cls=LTX23DistilledSamplingParam,
+        pipeline_config_cls=LTX2T2VConfig,
+        hf_model_paths=[
+            "FastVideo/LTX2.3-Distilled-Diffusers",
+        ],
+        model_detectors=[
+            lambda path: "ltx2.3" in path.lower() and
+            "distilled" in path.lower(),
+        ],
+    )
     # LTX-2 (distilled)
     register_configs(
         sampling_param_cls=LTX2DistilledSamplingParam,
@@ -268,7 +296,7 @@ def _register_configs() -> None:
         ],
         model_detectors=[
             lambda path: ("ltx2" in path.lower() or "ltx-2" in path.lower()) and
-            "distilled" in path.lower(),
+            "distilled" in path.lower() and "2.3" not in path.lower(),
         ],
     )
 

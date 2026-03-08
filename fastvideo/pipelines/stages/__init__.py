@@ -29,6 +29,8 @@ from fastvideo.pipelines.stages.latent_preparation import (
     Cosmos25V2WLatentPreparationStage, LatentPreparationStage)
 from fastvideo.pipelines.stages.ltx2_audio_decoding import LTX2AudioDecodingStage
 from fastvideo.pipelines.stages.ltx2_denoising import LTX2DenoisingStage
+from fastvideo.pipelines.stages.ltx2_distilled_denoising import (
+    LTX2DistilledDenoisingStage)
 from fastvideo.pipelines.stages.ltx2_latent_preparation import (
     LTX2LatentPreparationStage)
 from fastvideo.pipelines.stages.ltx2_text_encoding import LTX2TextEncodingStage
@@ -72,6 +74,7 @@ __all__ = [
     "Cosmos25V2WDenoisingStage",
     "Cosmos25AutoDenoisingStage",
     "LTX2DenoisingStage",
+    "LTX2DistilledDenoisingStage",
     "LTX2TextEncodingStage",
     "SRDenoisingStage",
     "EncodingStage",

@@ -56,17 +56,29 @@ class LTX2BaseSamplingParam(SamplingParam):
 
 @dataclass
 class LTX2DistilledSamplingParam(SamplingParam):
-    """Default sampling parameters for LTX-2 distilled one-stage T2V."""
+    """Default sampling parameters for LTX-2 distilled one-stage T2V.
+
+    All guidance is disabled for distilled models.
+    """
 
     seed: int = 10
     num_frames: int = 121
-    height: int = 1024
-    width: int = 1536
+    height: int = 512
+    width: int = 768
     fps: int = 24
     num_inference_steps: int = 8
     guidance_scale: float = 1.0
-    # No default negative_prompt for distilled models
     negative_prompt: str = ""
+    # Explicitly disable all guidance for distilled models.
+    ltx2_cfg_scale_video: float = 1.0
+    ltx2_cfg_scale_audio: float = 1.0
+    ltx2_modality_scale_video: float = 1.0
+    ltx2_modality_scale_audio: float = 1.0
+    ltx2_rescale_scale: float = 0.0
+    ltx2_stg_scale_video: float = 0.0
+    ltx2_stg_scale_audio: float = 0.0
+    ltx2_stg_blocks_video: list[int] = field(default_factory=list)
+    ltx2_stg_blocks_audio: list[int] = field(default_factory=list)
 
 
 # =============================================================================
@@ -111,17 +123,31 @@ class LTX23BaseSamplingParam(SamplingParam):
 class LTX23DistilledSamplingParam(SamplingParam):
     """Default sampling parameters for LTX-2.3 distilled one-stage T2V.
 
-    Uses 8 denoising steps with CFG=1.0 for fast inference.
+    Uses 8 denoising steps with the official distilled sigma schedule.
+    All guidance is disabled (CFG=1.0, STG=0, modality=1.0) so the
+    denoising loop performs a single forward pass per step.
+
+    Reference: LTX-2/packages/ltx-pipelines/src/ltx_pipelines/distilled.py
     """
 
     seed: int = 10
     num_frames: int = 121
-    height: int = 1024
-    width: int = 1536
+    height: int = 512
+    width: int = 768
     fps: int = 24
     num_inference_steps: int = 8
     guidance_scale: float = 1.0
     negative_prompt: str = ""
+    # Explicitly disable all guidance for distilled models.
+    ltx2_cfg_scale_video: float = 1.0
+    ltx2_cfg_scale_audio: float = 1.0
+    ltx2_modality_scale_video: float = 1.0
+    ltx2_modality_scale_audio: float = 1.0
+    ltx2_rescale_scale: float = 0.0
+    ltx2_stg_scale_video: float = 0.0
+    ltx2_stg_scale_audio: float = 0.0
+    ltx2_stg_blocks_video: list[int] = field(default_factory=list)
+    ltx2_stg_blocks_audio: list[int] = field(default_factory=list)
 
 
 @dataclass

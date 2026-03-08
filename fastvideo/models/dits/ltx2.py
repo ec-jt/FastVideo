@@ -817,7 +817,8 @@ class TransformerArgsPreprocessor:
             context = context.to(x.dtype)
         if attention_mask is not None and attention_mask.device != x.device:
             attention_mask = attention_mask.to(x.device)
-        context = self.caption_projection(context)
+        if self.caption_projection is not None:
+            context = self.caption_projection(context)
         context = context.view(batch_size, -1, x.shape[-1])
         return context, attention_mask
 
@@ -2017,10 +2018,13 @@ class LTXModel(torch.nn.Module):
         # LTX-2.3 uses embedding_coefficient=9 when cross_attention_adaln is enabled (6 base + 3 cross-attn)
         adaln_coefficient = 9 if self.cross_attention_adaln else 6
         self.adaln_single = AdaLayerNormSingle(self.inner_dim, embedding_coefficient=adaln_coefficient)
-        self.caption_projection = PixArtAlphaTextProjection(
-            in_features=caption_channels,
-            hidden_size=self.inner_dim,
-        )
+        # LTX-2.3 (22B): caption projection is in the text encoder,
+        # not the transformer.  Only create for LTX-2 (19B).
+        if not self.cross_attention_adaln:
+            self.caption_projection = PixArtAlphaTextProjection(
+                in_features=caption_channels,
+                hidden_size=self.inner_dim,
+            )
         # LTX-2.3: prompt_adaln_single for cross-attention conditioning
         self.prompt_adaln_single = (
             AdaLayerNormSingle(self.inner_dim, embedding_coefficient=2)
@@ -2041,10 +2045,13 @@ class LTXModel(torch.nn.Module):
         # LTX-2.3 uses embedding_coefficient=9 when cross_attention_adaln is enabled (6 base + 3 cross-attn)
         adaln_coefficient = 9 if self.cross_attention_adaln else 6
         self.audio_adaln_single = AdaLayerNormSingle(self.audio_inner_dim, embedding_coefficient=adaln_coefficient)
-        self.audio_caption_projection = PixArtAlphaTextProjection(
-            in_features=caption_channels,
-            hidden_size=self.audio_inner_dim,
-        )
+        # LTX-2.3 (22B): caption projection is in the text encoder,
+        # not the transformer.  Only create for LTX-2 (19B).
+        if not self.cross_attention_adaln:
+            self.audio_caption_projection = PixArtAlphaTextProjection(
+                in_features=caption_channels,
+                hidden_size=self.audio_inner_dim,
+            )
         # LTX-2.3: audio_prompt_adaln_single for cross-attention conditioning
         self.audio_prompt_adaln_single = (
             AdaLayerNormSingle(self.audio_inner_dim, embedding_coefficient=2)
@@ -2077,7 +2084,7 @@ class LTXModel(torch.nn.Module):
             self.video_args_preprocessor = MultiModalTransformerArgsPreprocessor(
                 patchify_proj=self.patchify_proj,
                 adaln=self.adaln_single,
-                caption_projection=self.caption_projection,
+                caption_projection=getattr(self, "caption_projection", None),
                 cross_scale_shift_adaln=self.av_ca_video_scale_shift_adaln_single,
                 cross_gate_adaln=self.av_ca_a2v_gate_adaln_single,
                 inner_dim=self.inner_dim,
@@ -2095,7 +2102,7 @@ class LTXModel(torch.nn.Module):
             self.audio_args_preprocessor = MultiModalTransformerArgsPreprocessor(
                 patchify_proj=self.audio_patchify_proj,
                 adaln=self.audio_adaln_single,
-                caption_projection=self.audio_caption_projection,
+                caption_projection=getattr(self, "audio_caption_projection", None),
                 cross_scale_shift_adaln=self.av_ca_audio_scale_shift_adaln_single,
                 cross_gate_adaln=self.av_ca_v2a_gate_adaln_single,
                 inner_dim=self.audio_inner_dim,
@@ -2114,7 +2121,7 @@ class LTXModel(torch.nn.Module):
             self.video_args_preprocessor = TransformerArgsPreprocessor(
                 patchify_proj=self.patchify_proj,
                 adaln=self.adaln_single,
-                caption_projection=self.caption_projection,
+                caption_projection=getattr(self, "caption_projection", None),
                 inner_dim=self.inner_dim,
                 max_pos=self.positional_embedding_max_pos,
                 num_attention_heads=self.num_attention_heads,
@@ -2128,7 +2135,7 @@ class LTXModel(torch.nn.Module):
             self.audio_args_preprocessor = TransformerArgsPreprocessor(
                 patchify_proj=self.audio_patchify_proj,
                 adaln=self.audio_adaln_single,
-                caption_projection=self.audio_caption_projection,
+                caption_projection=getattr(self, "audio_caption_projection", None),
                 inner_dim=self.audio_inner_dim,
                 max_pos=self.audio_positional_embedding_max_pos,
                 num_attention_heads=self.audio_num_attention_heads,
