@@ -58,6 +58,7 @@ class GemmaConnectorConfig:
     rope_type: LTXRopeType
     double_precision_rope: bool
     num_learnable_registers: int | None
+    apply_gated_attention: bool = False
 
 
 class GemmaFeaturesExtractorProjLinear(nn.Module):
@@ -110,6 +111,7 @@ class _BasicTransformerBlock1D(nn.Module):
         dim_head: int,
         rope_type: LTXRopeType,
         norm_eps: float = 1e-6,
+        apply_gated_attention: bool = False,
     ) -> None:
         super().__init__()
         self.attn1 = _GemmaAttention(
@@ -119,6 +121,7 @@ class _BasicTransformerBlock1D(nn.Module):
             dim_head=dim_head,
             norm_eps=norm_eps,
             rope_type=rope_type,
+            apply_gated_attention=apply_gated_attention,
         )
         self.ff = FeedForward(dim, dim_out=dim)
         self.norm_eps = norm_eps
@@ -165,6 +168,7 @@ class _GemmaAttention(nn.Module):
         dim_head: int,
         norm_eps: float,
         rope_type: LTXRopeType,
+        apply_gated_attention: bool = False,
     ) -> None:
         super().__init__()
         inner_dim = dim_head * heads
@@ -180,6 +184,12 @@ class _GemmaAttention(nn.Module):
         self.to_k = nn.Linear(context_dim, inner_dim, bias=True)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=True)
         self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim, bias=True), nn.Identity())
+
+        # LTX-2.3: per-head gated attention (2*sigmoid for identity init)
+        self.to_gate_logits = (
+            nn.Linear(query_dim, heads, bias=True)
+            if apply_gated_attention else None
+        )
 
     def forward(
         self,
@@ -222,6 +232,15 @@ class _GemmaAttention(nn.Module):
             is_causal=False,
         )
         out = out.transpose(1, 2).reshape(b, q_len, -1)
+
+        # LTX-2.3: apply per-head gated attention
+        if self.to_gate_logits is not None:
+            gate_logits = self.to_gate_logits(x)
+            gates = 2.0 * torch.sigmoid(gate_logits)
+            out = out.view(b, q_len, self.heads, self.dim_head)
+            out = out * gates.unsqueeze(-1)
+            out = out.reshape(b, q_len, -1)
+
         return self.to_out(out)
 
 
@@ -245,6 +264,7 @@ class Embeddings1DConnector(nn.Module):
                     heads=config.num_attention_heads,
                     dim_head=config.attention_head_dim,
                     rope_type=config.rope_type,
+                    apply_gated_attention=config.apply_gated_attention,
                 )
                 for _ in range(config.num_layers)
             ]
@@ -372,6 +392,9 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
             audio_out_features=audio_fe_out,
         )
 
+        gated_attn = getattr(
+            arch, "connector_apply_gated_attention", False,
+        )
         connector_config = GemmaConnectorConfig(
             num_attention_heads=arch.connector_num_attention_heads,
             attention_head_dim=arch.connector_attention_head_dim,
@@ -381,6 +404,7 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
             rope_type=LTXRopeType(arch.connector_rope_type),
             double_precision_rope=arch.connector_double_precision_rope,
             num_learnable_registers=arch.connector_num_learnable_registers,
+            apply_gated_attention=gated_attn,
         )
         self.embeddings_connector = Embeddings1DConnector(connector_config)
 
@@ -397,6 +421,7 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
                 rope_type=LTXRopeType(arch.connector_rope_type),
                 double_precision_rope=arch.connector_double_precision_rope,
                 num_learnable_registers=arch.connector_num_learnable_registers,
+                apply_gated_attention=gated_attn,
             )
         else:
             audio_connector_config = connector_config

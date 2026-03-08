@@ -754,6 +754,7 @@ class TransformerArgs:
     cross_scale_shift_timestep: torch.Tensor | None
     cross_gate_timestep: torch.Tensor | None
     enabled: bool
+    prompt_timestep: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -782,6 +783,7 @@ class TransformerArgsPreprocessor:
         double_precision_rope: bool,
         positional_embedding_theta: float,
         rope_type: LTXRopeType,
+        prompt_adaln: AdaLayerNormSingle | None = None,
     ) -> None:
         self.patchify_proj = patchify_proj
         self.adaln = adaln
@@ -794,6 +796,7 @@ class TransformerArgsPreprocessor:
         self.double_precision_rope = double_precision_rope
         self.positional_embedding_theta = positional_embedding_theta
         self.rope_type = rope_type
+        self.prompt_adaln = prompt_adaln
 
     def _prepare_timestep(
         self, timestep: torch.Tensor, batch_size: int, hidden_dtype: torch.dtype
@@ -863,6 +866,22 @@ class TransformerArgsPreprocessor:
             latent = latent.contiguous()
         x = self.patchify_proj(latent)
         timestep, embedded_timestep = self._prepare_timestep(modality.timesteps, x.shape[0], modality.latent.dtype)
+        # LTX-2.3: compute prompt_timestep for cross-attention AdaLN.
+        # Uses a single scalar sigma per batch item (not per-token),
+        # matching upstream ``modality.sigma`` usage.
+        prompt_timestep = None
+        if self.prompt_adaln is not None:
+            # modality.timesteps is (B, num_tokens) — take first
+            # token as the scalar sigma for the whole batch item.
+            sigma = modality.timesteps[:, 0:1]
+            prompt_ts = sigma * self.timestep_scale_multiplier
+            prompt_timestep, _ = self.prompt_adaln(
+                prompt_ts.flatten(),
+                hidden_dtype=modality.latent.dtype,
+            )
+            prompt_timestep = prompt_timestep.view(
+                x.shape[0], 1, prompt_timestep.shape[-1],
+            )
         context, attention_mask = self._prepare_context(modality.context, x, modality.context_mask)
         attention_mask = self._prepare_attention_mask(attention_mask, modality.latent.dtype)
         pe = self._prepare_positional_embeddings(
@@ -884,7 +903,52 @@ class TransformerArgsPreprocessor:
             cross_scale_shift_timestep=None,
             cross_gate_timestep=None,
             enabled=modality.enabled,
+            prompt_timestep=prompt_timestep,
         )
+
+
+def _apply_cross_attention_adaln(
+    x: torch.Tensor,
+    context: torch.Tensor,
+    attn: torch.nn.Module,
+    q_shift: torch.Tensor,
+    q_scale: torch.Tensor,
+    q_gate: torch.Tensor,
+    prompt_scale_shift_table: torch.Tensor | None,
+    prompt_timestep: torch.Tensor | None,
+    context_mask: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+) -> torch.Tensor:
+    """Apply cross-attention with AdaLN modulation (LTX-2.3).
+
+    Modulates query with shift/scale/gate from the main AdaLN,
+    and modulates context (key/value) with prompt AdaLN.
+    Matches upstream ``apply_cross_attention_adaln``.
+    """
+    batch_size = x.shape[0]
+    if prompt_scale_shift_table is not None and prompt_timestep is not None:
+        shift_kv, scale_kv = (
+            prompt_scale_shift_table[None, None].to(
+                device=x.device, dtype=x.dtype,
+            )
+            + prompt_timestep.reshape(
+                batch_size, prompt_timestep.shape[1], 2, -1,
+            )
+        ).unbind(dim=2)
+    else:
+        shift_kv = torch.zeros_like(x[:, :1, :])
+        scale_kv = torch.zeros_like(x[:, :1, :])
+    attn_input = (
+        torch.nn.functional.rms_norm(
+            x, (x.shape[-1],), eps=norm_eps,
+        ) * (1 + q_scale) + q_shift
+    )
+    encoder_hidden_states = context * (1 + scale_kv) + shift_kv
+    return (
+        attn(attn_input, context=encoder_hidden_states,
+             mask=context_mask)
+        * q_gate
+    )
 
 
 class MultiModalTransformerArgsPreprocessor:
@@ -908,6 +972,7 @@ class MultiModalTransformerArgsPreprocessor:
         positional_embedding_theta: float,
         rope_type: LTXRopeType,
         av_ca_timestep_scale_multiplier: int,
+        prompt_adaln: AdaLayerNormSingle | None = None,
     ) -> None:
         self.simple_preprocessor = TransformerArgsPreprocessor(
             patchify_proj=patchify_proj,
@@ -921,6 +986,7 @@ class MultiModalTransformerArgsPreprocessor:
             double_precision_rope=double_precision_rope,
             positional_embedding_theta=positional_embedding_theta,
             rope_type=rope_type,
+            prompt_adaln=prompt_adaln,
         )
         self.cross_scale_shift_adaln = cross_scale_shift_adaln
         self.cross_gate_adaln = cross_gate_adaln
@@ -1629,6 +1695,46 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         self.norm_eps = norm_eps
 
+    def _apply_text_cross_attention(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        attn: torch.nn.Module,
+        scale_shift_table: torch.Tensor,
+        prompt_scale_shift_table: torch.Tensor | None,
+        timestep: torch.Tensor,
+        prompt_timestep: torch.Tensor | None,
+        context_mask: torch.Tensor | None,
+        cross_attention_adaln: bool = False,
+    ) -> torch.Tensor:
+        """Apply text cross-attention with optional AdaLN modulation.
+
+        For LTX-2 (cross_attention_adaln=False): plain rms_norm → attn.
+        For LTX-2.3 (cross_attention_adaln=True): AdaLN-modulated
+        query + context + output gating using scale_shift_table[6:9]
+        and prompt_scale_shift_table + prompt_timestep.
+        """
+        if cross_attention_adaln:
+            shift_q, scale_q, gate = self.get_ada_values(
+                scale_shift_table, x.shape[0], timestep,
+                slice(6, 9),
+            )
+            return _apply_cross_attention_adaln(
+                x, context, attn,
+                shift_q, scale_q, gate,
+                prompt_scale_shift_table,
+                prompt_timestep,
+                context_mask,
+                self.norm_eps,
+            )
+        return attn(
+            torch.nn.functional.rms_norm(
+                x, (x.shape[-1],), eps=self.norm_eps,
+            ),
+            context=context,
+            mask=context_mask,
+        )
+
     def _register_fsdp_backward_hooks_on_output(self, vx, ax):
         """Register backward hooks on output tensors to trigger FSDP2 unshard.
         
@@ -1725,11 +1831,17 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     ) * vgate_msa
                 else:
                     vx = vx + self.attn1(norm_vx, pe=video.positional_embeddings) * vgate_msa
-            # Text cross-attention: no SP mask needed (text is replicated, uses local attention)
-            vx = vx + self.attn2(
-                torch.nn.functional.rms_norm(vx, (vx.shape[-1],), eps=self.norm_eps),
-                context=video.context,
-                mask=video.context_mask,
+            # Text cross-attention with optional AdaLN (LTX-2.3)
+            vx = vx + self._apply_text_cross_attention(
+                vx,
+                video.context,
+                self.attn2,
+                self.scale_shift_table,
+                getattr(self, "prompt_scale_shift_table", None),
+                video.timesteps,
+                video.prompt_timestep,
+                video.context_mask,
+                cross_attention_adaln=self.cross_attention_adaln,
             )
 
         if run_ax:
@@ -1746,11 +1858,17 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     ) * agate_msa
                 else:
                     ax = ax + self.audio_attn1(norm_ax, pe=audio.positional_embeddings) * agate_msa
-            # Text cross-attention: no SP mask needed (text is replicated, uses local attention)
-            ax = ax + self.audio_attn2(
-                torch.nn.functional.rms_norm(ax, (ax.shape[-1],), eps=self.norm_eps),
-                context=audio.context,
-                mask=audio.context_mask,
+            # Text cross-attention with optional AdaLN (LTX-2.3)
+            ax = ax + self._apply_text_cross_attention(
+                ax,
+                audio.context,
+                self.audio_attn2,
+                self.audio_scale_shift_table,
+                getattr(self, "audio_prompt_scale_shift_table", None),
+                audio.timesteps,
+                audio.prompt_timestep,
+                audio.context_mask,
+                cross_attention_adaln=self.cross_attention_adaln,
             )
 
         if (run_a2v or run_v2a) and not skip_cross_modal_attn:
@@ -2098,6 +2216,7 @@ class LTXModel(torch.nn.Module):
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
                 av_ca_timestep_scale_multiplier=self.av_ca_timestep_scale_multiplier,
+                prompt_adaln=getattr(self, "prompt_adaln_single", None),
             )
             self.audio_args_preprocessor = MultiModalTransformerArgsPreprocessor(
                 patchify_proj=self.audio_patchify_proj,
@@ -2116,6 +2235,7 @@ class LTXModel(torch.nn.Module):
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
                 av_ca_timestep_scale_multiplier=self.av_ca_timestep_scale_multiplier,
+                prompt_adaln=getattr(self, "audio_prompt_adaln_single", None),
             )
         elif self.model_type.is_video_enabled():
             self.video_args_preprocessor = TransformerArgsPreprocessor(
@@ -2130,6 +2250,7 @@ class LTXModel(torch.nn.Module):
                 double_precision_rope=self.double_precision_rope,
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
+                prompt_adaln=getattr(self, "prompt_adaln_single", None),
             )
         elif self.model_type.is_audio_enabled():
             self.audio_args_preprocessor = TransformerArgsPreprocessor(
@@ -2144,6 +2265,7 @@ class LTXModel(torch.nn.Module):
                 double_precision_rope=self.double_precision_rope,
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
+                prompt_adaln=getattr(self, "audio_prompt_adaln_single", None),
             )
 
     def _init_transformer_blocks(
