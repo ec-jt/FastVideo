@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import functools
 import math
 import os
+from pathlib import Path
 from typing import Any, Iterable
 
 import torch
@@ -491,6 +493,66 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
             self._gemma_model.eval()
         return self._gemma_model
 
+    @functools.cached_property
+    def _t2v_system_prompt(self) -> str:
+        """Load the T2V system prompt for prompt enhancement."""
+        prompt_path = (
+            Path(__file__).resolve().parents[2]
+            / "assets" / "prompts"
+            / "gemma_t2v_system_prompt.txt"
+        )
+        with open(prompt_path, encoding="utf-8") as f:
+            return f.read()
+
+    @torch.no_grad()
+    def enhance_t2v(
+        self,
+        prompt: str,
+        tokenizer: AutoTokenizer | None = None,
+        max_new_tokens: int = 512,
+        seed: int = 10,
+    ) -> str:
+        """Enhance a short user prompt into a detailed video+audio
+        description using Gemma3's generative capabilities.
+
+        Matches upstream ``GemmaTextEncoder.enhance_t2v()``.
+
+        Args:
+            prompt: Short user prompt to enhance.
+            tokenizer: Optional tokenizer; loaded from
+                ``gemma_model_path`` if not provided.
+            max_new_tokens: Maximum tokens to generate.
+            seed: Random seed for reproducibility.
+
+        Returns:
+            Enhanced prompt string.
+        """
+        model = self.gemma_model
+        if tokenizer is None:
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.gemma_model_path, local_files_only=True,
+            )
+        messages = [
+            {"role": "system", "content": self._t2v_system_prompt},
+            {"role": "user", "content": f"user prompt: {prompt}"},
+        ]
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            return_tensors="pt",
+            add_generation_prompt=True,
+        ).to(model.device)
+        torch.manual_seed(seed)
+        outputs = model.generate(
+            inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+        )
+        generated = tokenizer.decode(
+            outputs[0][inputs.shape[1]:],
+            skip_special_tokens=True,
+        )
+        return _clean_enhanced_response(generated)
+
     def _run_feature_extractor(
         self,
         hidden_states: tuple[torch.Tensor, ...],
@@ -796,6 +858,26 @@ def _rescale_norm(
     Matches upstream ``_rescale_norm``: ``x * sqrt(target_dim / source_dim)``.
     """
     return x * math.sqrt(target_dim / source_dim)
+
+
+# Unicode replacements matching upstream ``clean_response``.
+_UNICODE_REPLACEMENTS = str.maketrans(
+    "\u2018\u2019\u201c\u201d\u2014\u2013\u00a0\u2032\u2212",
+    "''\"\"-- '-",
+)
+
+
+def _clean_enhanced_response(text: str) -> str:
+    """Clean Gemma's enhanced prompt output.
+
+    Removes curly quotes and leading non-letter characters that
+    Gemma tends to insert.  Matches upstream ``clean_response``.
+    """
+    text = text.translate(_UNICODE_REPLACEMENTS)
+    for i, char in enumerate(text):
+        if char.isalpha():
+            return text[i:]
+    return text
 
 
 # Entry point for model registry
