@@ -1261,20 +1261,76 @@ class AudioDecoderConfigurator:
 
 
 class VocoderConfigurator:
-    """Factory for Vocoder from checkpoint config."""
+    """Factory for Vocoder from checkpoint config.
+
+    Handles both flat and nested config formats:
+    - Flat: ``{"resblock_kernel_sizes": ..., ...}``
+    - Nested (LTX-2.3): ``{"vocoder": {...}, "bwe": {...}}``
+
+    When a ``"bwe"`` key is present the base vocoder is wrapped
+    with bandwidth-extension upsampling via
+    :class:`VocoderWithBWE`.
+    """
 
     @classmethod
     def from_config(cls, config: dict) -> Vocoder:
-        vocoder_cfg = config.get("vocoder", {})
+        top = config.get("vocoder", config)
+        # Detect nested format: {"vocoder": {...}, "bwe": {...}}
+        if "vocoder" in top and isinstance(top["vocoder"], dict):
+            vocoder_cfg = top["vocoder"]
+            bwe_cfg = top.get("bwe")
+        else:
+            vocoder_cfg = top
+            bwe_cfg = None
+
+        base_vocoder = cls._build_vocoder(vocoder_cfg)
+
+        if bwe_cfg is not None:
+            return VocoderWithBWE(
+                base_vocoder=base_vocoder,
+                bwe_vocoder=cls._build_vocoder(
+                    bwe_cfg,
+                    apply_final_activation=False,
+                ),
+                input_sampling_rate=bwe_cfg.get(
+                    "input_sampling_rate", 16000,
+                ),
+                output_sampling_rate=bwe_cfg.get(
+                    "output_sampling_rate", 48000,
+                ),
+                hop_length=bwe_cfg.get("hop_length", 80),
+                n_fft=bwe_cfg.get("n_fft", 512),
+                win_size=bwe_cfg.get("win_size", 512),
+                num_mels=bwe_cfg.get("num_mels", 64),
+            )
+
+        return base_vocoder
+
+    @classmethod
+    def _build_vocoder(
+        cls,
+        cfg: dict,
+        apply_final_activation: bool = True,
+    ) -> Vocoder:
         return Vocoder(
-            resblock_kernel_sizes=vocoder_cfg.get("resblock_kernel_sizes", [3, 7, 11]),
-            upsample_rates=vocoder_cfg.get("upsample_rates", [6, 5, 2, 2, 2]),
-            upsample_kernel_sizes=vocoder_cfg.get("upsample_kernel_sizes", [16, 15, 8, 4, 4]),
-            resblock_dilation_sizes=vocoder_cfg.get("resblock_dilation_sizes", [[1, 3, 5], [1, 3, 5], [1, 3, 5]]),
-            upsample_initial_channel=vocoder_cfg.get("upsample_initial_channel", 1024),
-            stereo=vocoder_cfg.get("stereo", True),
-            resblock=vocoder_cfg.get("resblock", "1"),
-            output_sample_rate=vocoder_cfg.get("output_sample_rate", 24000),
+            resblock_kernel_sizes=cfg.get(
+                "resblock_kernel_sizes", [3, 7, 11]),
+            upsample_rates=cfg.get(
+                "upsample_rates", [6, 5, 2, 2, 2]),
+            upsample_kernel_sizes=cfg.get(
+                "upsample_kernel_sizes",
+                [16, 15, 8, 4, 4]),
+            resblock_dilation_sizes=cfg.get(
+                "resblock_dilation_sizes",
+                [[1, 3, 5], [1, 3, 5], [1, 3, 5]]),
+            upsample_initial_channel=cfg.get(
+                "upsample_initial_channel", 1024),
+            stereo=cfg.get("stereo", True),
+            resblock=cfg.get("resblock", "1"),
+            output_sample_rate=cfg.get(
+                "output_sample_rate", 24000),
+            apply_final_activation=apply_final_activation,
+            activation=cfg.get("activation", "snake"),
         )
 
 

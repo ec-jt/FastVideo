@@ -24,6 +24,10 @@ def _is_gemma_model(n: str, m) -> bool:
 class LTX2GemmaArchConfig(TextEncoderArchConfig):
     architectures: list[str] = field(
         default_factory=lambda: ["LTX2GemmaTextEncoderModel"])
+    # LTX-2 audio requires hidden_states from the encoder
+    # to extract audio embeddings (audio_encoding from
+    # hidden_states[0]).
+    output_hidden_states: bool = True
     hidden_size: int = 3840
     num_hidden_layers: int = 48
     num_attention_heads: int = 30
