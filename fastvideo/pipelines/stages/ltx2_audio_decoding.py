@@ -9,7 +9,13 @@ import os
 
 import torch
 
-from fastvideo.models.dits.ltx2 import DEFAULT_LTX2_VOCODER_OUTPUT_SAMPLE_RATE
+from fastvideo.models.audio.ltx2_audio_vae import (
+    LTX2Vocoder,
+    VocoderWithBWE,
+)
+from fastvideo.models.dits.ltx2 import (
+    DEFAULT_LTX2_VOCODER_OUTPUT_SAMPLE_RATE,
+)
 
 from fastvideo.distributed import get_local_torch_device
 from fastvideo.fastvideo_args import FastVideoArgs
@@ -20,6 +26,23 @@ from fastvideo.pipelines.stages.validators import StageValidators as V
 from fastvideo.pipelines.stages.validators import VerificationResult
 
 logger = init_logger(__name__)
+
+
+def _get_vocoder_sample_rate(vocoder) -> int:
+    """Extract the output sample rate from a vocoder model.
+
+    Supports both :class:`LTX2Vocoder` (wrapper) and raw
+    :class:`Vocoder` / :class:`VocoderWithBWE` instances.
+    Falls back to the legacy constant when the attribute is
+    not available.
+    """
+    model = getattr(vocoder, "model", vocoder)
+    if isinstance(model, VocoderWithBWE):
+        return model.output_sampling_rate
+    rate = getattr(model, "output_sampling_rate", None)
+    if rate is not None:
+        return rate
+    return DEFAULT_LTX2_VOCODER_OUTPUT_SAMPLE_RATE
 
 
 class LTX2AudioDecodingStage(PipelineStage):
@@ -44,24 +67,35 @@ class LTX2AudioDecodingStage(PipelineStage):
         self.vocoder = self.vocoder.to(device)
         audio_latents = audio_latents.to(device)
 
-        disable_autocast = os.getenv("LTX2_DISABLE_AUDIO_AUTOCAST", "1") == "1"
+        disable_autocast = (
+            os.getenv("LTX2_DISABLE_AUDIO_AUTOCAST", "1") == "1"
+        )
         with torch.no_grad(), torch.autocast(
                 device_type="cuda",
                 dtype=audio_latents.dtype,
                 enabled=not disable_autocast,
         ):
             decoded_spec = self.audio_decoder(audio_latents)
-            audio_wave = self.vocoder(decoded_spec).squeeze(0).float()
+            audio_wave = (
+                self.vocoder(decoded_spec).squeeze(0).float()
+            )
 
         # Move to CPU for pickling across process boundary
         batch.extra["audio"] = audio_wave.cpu()
-        batch.extra[
-            "audio_sample_rate"] = DEFAULT_LTX2_VOCODER_OUTPUT_SAMPLE_RATE
+        batch.extra["audio_sample_rate"] = (
+            _get_vocoder_sample_rate(self.vocoder)
+        )
         return batch
 
-    def verify_input(self, batch: ForwardBatch,
-                     fastvideo_args: FastVideoArgs) -> VerificationResult:
+    def verify_input(
+        self,
+        batch: ForwardBatch,
+        fastvideo_args: FastVideoArgs,
+    ) -> VerificationResult:
         result = VerificationResult()
-        result.add_check("audio_latents", batch.extra.get("ltx2_audio_latents"),
-                         V.none_or_tensor)
+        result.add_check(
+            "audio_latents",
+            batch.extra.get("ltx2_audio_latents"),
+            V.none_or_tensor,
+        )
         return result
