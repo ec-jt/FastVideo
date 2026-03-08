@@ -53,7 +53,7 @@ uv pip install fastvideo
 Also optionally install FlashAttention:
 
 ```bash
-uv pip install flash-attn --no-build-isolation -v
+uv pip install flash-attn==2.8.3 --no-build-isolation -v
 ```
 
 #### With Conda environment (alternative)
@@ -65,7 +65,7 @@ pip install fastvideo
 Also optionally install FlashAttention:
 
 ```bash
-pip install flash-attn --no-build-isolation -v
+pip install flash-attn==2.8.3 --no-build-isolation -v
 ```
 
 ### Installation from Source
@@ -84,10 +84,18 @@ Basic installation:
 uv pip install -e .
 ```
 
+Or install with dev dependencies (lint + test extras):
+
+```bash
+uv pip install -e ".[dev]"
+```
+
 Alternative with Conda environment:
 
 ```bash
 pip install -e .
+# Or with dev dependencies:
+pip install -e ".[dev]"
 ```
 
 ### Optional Dependencies
@@ -95,13 +103,13 @@ pip install -e .
 #### Flash Attention
 
 ```bash
-uv pip install flash-attn --no-build-isolation -v
+uv pip install flash-attn==2.8.3 --no-build-isolation -v
 ```
 
 Alternative with Conda environment:
 
 ```bash
-pip install flash-attn --no-build-isolation -v
+pip install flash-attn==2.8.3 --no-build-isolation -v
 ```
 
 ## Set up using Docker

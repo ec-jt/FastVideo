@@ -35,22 +35,30 @@ pip install fastvideo
 ```bash
 git clone https://github.com/hao-ai-lab/FastVideo.git
 cd FastVideo
+
+# Basic install
 uv pip install -e .
 
+# Or install with dev dependencies (lint + test extras)
+uv pip install -e ".[dev]"
+
 # optional: install flash-attn
-uv pip install flash-attn --no-build-isolation -v
+uv pip install flash-attn==2.8.3 --no-build-isolation -v
 ```
 
 Alternative with Conda environment:
 
 ```bash
 pip install -e .
-pip install flash-attn --no-build-isolation -v
+# Or with dev dependencies:
+pip install -e ".[dev]"
+
+pip install flash-attn==2.8.3 --no-build-isolation -v
 ```
 
 ## Hardware Requirements
 
-- **NVIDIA GPUs**: CUDA 11.8+ with compute capability 7.0+
+- **NVIDIA GPUs**: CUDA 12.8+ with compute capability 7.0+
 - **Apple Silicon**: macOS 12.0+ with M1/M2/M3 chips
 - **CPU**: x86_64 architecture (for CPU-only inference)
 
