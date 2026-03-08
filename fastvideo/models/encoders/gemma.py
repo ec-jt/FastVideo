@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 from typing import Any, Iterable
 
@@ -74,8 +75,11 @@ class GemmaFeaturesExtractorProjLinear(nn.Module):
         in_features: int,
         out_features: int,
         audio_out_features: int | None = None,
+        embedding_dim: int | None = None,
     ) -> None:
         super().__init__()
+        # embedding_dim is the Gemma hidden_size, used by V2 rescale
+        self.embedding_dim = embedding_dim
         if audio_out_features is not None:
             # LTX-2.3: separate video and audio projections
             self.video_aggregate_embed = nn.Linear(
@@ -92,12 +96,24 @@ class GemmaFeaturesExtractorProjLinear(nn.Module):
             )
 
     def forward(
-        self, x: torch.Tensor
+        self,
+        x: torch.Tensor,
+        rescale: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.aggregate_embed is not None:
             return self.aggregate_embed(x), None
-        video = self.video_aggregate_embed(x)
-        audio = self.audio_aggregate_embed(x)
+        if rescale and self.embedding_dim is not None:
+            v_dim = self.video_aggregate_embed.out_features
+            video = self.video_aggregate_embed(
+                _rescale_norm(x, v_dim, self.embedding_dim)
+            )
+            a_dim = self.audio_aggregate_embed.out_features
+            audio = self.audio_aggregate_embed(
+                _rescale_norm(x, a_dim, self.embedding_dim)
+            )
+        else:
+            video = self.video_aggregate_embed(x)
+            audio = self.audio_aggregate_embed(x)
         return video, audio
 
 
@@ -379,6 +395,12 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
         super().__init__(config)
         arch = config.arch_config
 
+        # V1 (LTX-2 19B) vs V2 (LTX-2.3 22B) feature extractor
+        self._feature_extractor_version = getattr(
+            arch, "feature_extractor_version", "v1",
+        )
+        embedding_dim = getattr(arch, "gemma_embedding_dim", None)
+
         # LTX-2.3: compute audio feature extractor output size
         audio_fe_out = None
         audio_head_dim = getattr(arch, "audio_connector_attention_head_dim", None)
@@ -390,6 +412,7 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
             in_features=arch.feature_extractor_in_features,
             out_features=arch.feature_extractor_out_features,
             audio_out_features=audio_fe_out,
+            embedding_dim=embedding_dim,
         )
 
         gated_attn = getattr(
@@ -486,12 +509,26 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
                 f":sum={encoded_text_features.float().sum().item():.6f}"
             )
         encoded_text_features_dtype = encoded_text_features.dtype
-        sequence_lengths = attention_mask.sum(dim=-1)
-        normed_text_features = _norm_and_concat_padded_batch(
-            encoded_text_features, sequence_lengths, padding_side=padding_side
-        )
-        normed = normed_text_features.to(encoded_text_features_dtype)
-        video_features, audio_features = self.feature_extractor_linear(normed)
+
+        if self._feature_extractor_version == "v2":
+            # LTX-2.3 (22B): per-token RMS norm + rescale
+            normed = _norm_and_concat_per_token_rms(
+                encoded_text_features, attention_mask,
+            ).to(encoded_text_features_dtype)
+            video_features, audio_features = (
+                self.feature_extractor_linear(normed, rescale=True)
+            )
+        else:
+            # LTX-2 (19B): per-batch norm
+            sequence_lengths = attention_mask.sum(dim=-1)
+            normed = _norm_and_concat_padded_batch(
+                encoded_text_features,
+                sequence_lengths,
+                padding_side=padding_side,
+            ).to(encoded_text_features_dtype)
+            video_features, audio_features = (
+                self.feature_extractor_linear(normed)
+            )
         return video_features, audio_features
 
     def _convert_to_additive_mask(
@@ -510,25 +547,34 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
         connector_attention_mask = self._convert_to_additive_mask(
             attention_mask, encoded_input.dtype
         )
-        encoded, encoded_connector_attention_mask = self.embeddings_connector(
-            encoded_input, connector_attention_mask
+        # Save original additive mask for audio connector
+        original_additive_mask = connector_attention_mask
+
+        encoded, encoded_connector_attention_mask = (
+            self.embeddings_connector(
+                encoded_input, connector_attention_mask,
+            )
         )
 
-        attention_mask = (encoded_connector_attention_mask < 0.000001).to(
-            torch.int64
-        )
+        attention_mask = (
+            encoded_connector_attention_mask < 0.000001
+        ).to(torch.int64)
         attention_mask = attention_mask.reshape(
             [encoded.shape[0], encoded.shape[1], 1]
         )
         encoded = encoded * attention_mask
 
-        # LTX-2.3: use separate audio features if available
-        audio_input = audio_encoded_input if audio_encoded_input is not None else encoded_input
-        audio_connector_mask = self._convert_to_additive_mask(
-            attention_mask.squeeze(-1), audio_input.dtype
-        ) if audio_encoded_input is not None else connector_attention_mask
+        # LTX-2.3: use separate audio features if available.
+        # Always use the original additive mask (not the
+        # post-video-connector binary mask) for the audio
+        # connector, matching upstream EmbeddingsProcessor.
+        audio_input = (
+            audio_encoded_input
+            if audio_encoded_input is not None
+            else encoded_input
+        )
         encoded_for_audio, _ = self.audio_embeddings_connector(
-            audio_input, audio_connector_mask
+            audio_input, original_additive_mask,
         )
 
         return encoded, encoded_for_audio, attention_mask.squeeze(-1)
@@ -715,6 +761,42 @@ def _norm_and_concat_padded_batch(
     mask_flattened = mask.reshape(b, t, 1).expand(-1, -1, d * l)
     normed = normed.masked_fill(~mask_flattened, 0.0)
     return normed
+
+
+def _norm_and_concat_per_token_rms(
+    encoded_text: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Per-token RMS normalization for LTX-2.3 (V2) models.
+
+    Matches upstream ``FeatureExtractorV2`` / ``norm_and_concat_per_token_rms``.
+
+    Args:
+        encoded_text: ``[B, T, D, L]`` stacked hidden states.
+        attention_mask: ``[B, T]`` binary mask.
+
+    Returns:
+        ``[B, T, D*L]`` normalized tensor with padding zeroed out.
+    """
+    b, t, d, num_layers = encoded_text.shape
+    variance = torch.mean(encoded_text ** 2, dim=2, keepdim=True)
+    normed = encoded_text * torch.rsqrt(variance + 1e-6)
+    normed = normed.reshape(b, t, d * num_layers)
+    mask_3d = attention_mask.bool().unsqueeze(-1)  # [B, T, 1]
+    return torch.where(mask_3d, normed, torch.zeros_like(normed))
+
+
+def _rescale_norm(
+    x: torch.Tensor,
+    target_dim: int,
+    source_dim: int,
+) -> torch.Tensor:
+    """Rescale normalization used by LTX-2.3 (V2) feature extractor.
+
+    Matches upstream ``_rescale_norm``: ``x * sqrt(target_dim / source_dim)``.
+    """
+    return x * math.sqrt(target_dim / source_dim)
+
 
 # Entry point for model registry
 EntryClass = LTX2GemmaTextEncoderModel

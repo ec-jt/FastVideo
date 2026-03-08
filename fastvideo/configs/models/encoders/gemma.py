@@ -41,6 +41,11 @@ class LTX2GemmaArchConfig(TextEncoderArchConfig):
 
     feature_extractor_in_features: int = 3840 * 49
     feature_extractor_out_features: int = 3840
+    # "v1" for LTX-2 (19B): per-batch norm + single aggregate_embed
+    # "v2" for LTX-2.3 (22B): per-token RMS norm + rescale + dual embeds
+    feature_extractor_version: str = "v1"
+    # Gemma hidden_size used by V2 rescale normalization
+    gemma_embedding_dim: int = 3840
 
     connector_num_attention_heads: int = 30
     connector_attention_head_dim: int = 128
@@ -67,6 +72,23 @@ class LTX2GemmaArchConfig(TextEncoderArchConfig):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.tokenizer_kwargs["padding"] = "max_length"
+
+        # Auto-detect V2 feature extractor for LTX-2.3 (22B).
+        # ``caption_proj_before_connector=True`` is the reliable
+        # indicator that the model uses V2 normalization (per-token
+        # RMS norm + rescale) instead of V1 (per-batch norm).
+        if (
+            self.caption_proj_before_connector
+            and self.feature_extractor_version == "v1"
+        ):
+            self.feature_extractor_version = "v2"
+            # Derive Gemma text hidden_size from flat_dim / num_layers.
+            # flat_dim = hidden_size * (num_hidden_layers + 1)
+            num_layers = self.num_hidden_layers + 1
+            if num_layers > 0 and self.feature_extractor_in_features > 0:
+                self.gemma_embedding_dim = (
+                    self.feature_extractor_in_features // num_layers
+                )
 
 
 @dataclass
