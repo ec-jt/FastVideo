@@ -319,7 +319,16 @@ def load_model_from_full_model_state_dict(
                 f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
             )
         if not hasattr(meta_sharded_param, "device_mesh"):
-            full_tensor = full_tensor.to(device=device, dtype=param_dtype)
+            # When cpu_offload is requested without FSDP (e.g. for
+            # layerwise offload on GPUs smaller than the model),
+            # load weights to CPU instead of GPU.  The layerwise
+            # offload hooks will stream blocks to GPU on demand.
+            if cpu_offload:
+                full_tensor = full_tensor.to(
+                    device="cpu", dtype=param_dtype)
+            else:
+                full_tensor = full_tensor.to(
+                    device=device, dtype=param_dtype)
             # In cases where parts of the model aren't sharded, some parameters will be plain tensors
             sharded_tensor = full_tensor
         else:
@@ -353,9 +362,10 @@ def load_model_from_full_model_state_dict(
     for new_param_name in unused_keys:
         meta_sharded_param = meta_sd.get(new_param_name)
         if not hasattr(meta_sharded_param, "device_mesh"):
-            # Initialize with zeros
+            # Initialize with zeros (on CPU if offloading)
+            target_dev = "cpu" if cpu_offload else device
             sharded_tensor = torch.zeros_like(meta_sharded_param,
-                                              device=device,
+                                              device=target_dev,
                                               dtype=param_dtype)
         else:
             # Initialize with zeros and distribute

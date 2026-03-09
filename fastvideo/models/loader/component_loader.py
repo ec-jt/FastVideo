@@ -869,6 +869,24 @@ class TransformerLoader(ComponentLoader):
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
 
+        # Log transformer offloading strategy
+        if fastvideo_args.dit_layerwise_offload:
+            _offload_str = "layerwise (FastVideo custom hooks)"
+        elif fastvideo_args.use_fsdp_inference and fastvideo_args.dit_cpu_offload:
+            _offload_str = "FSDP2 + CPU offload"
+        elif fastvideo_args.use_fsdp_inference:
+            _offload_str = "FSDP2 inference (no CPU offload)"
+        elif fastvideo_args.dit_cpu_offload:
+            _offload_str = "bulk CPU offload"
+        else:
+            _offload_str = "none (all on GPU)"
+        logger.info(
+            "Transformer offload strategy: %s "
+            "(%.2fGB in bf16)",
+            _offload_str,
+            total_params * 2 / 1e9,
+        )
+
         assert next(model.parameters()).dtype == default_dtype, (
             "Model dtype does not match default dtype"
         )
@@ -876,16 +894,19 @@ class TransformerLoader(ComponentLoader):
         model = model.eval()
 
         if fastvideo_args.inference_mode and fastvideo_args.dit_layerwise_offload:
-            # Check if model has nn.ModuleList for layerwise offload compatibility
+            # Check recursively for nn.ModuleList (LTX2 nests
+            # transformer_blocks inside model.model).
             has_module_list = any(
-                isinstance(m, nn.ModuleList) for m in model.children()
+                isinstance(m, nn.ModuleList)
+                for m in model.modules()
             )
             if has_module_list:
                 enable_layerwise_offload(model)
             else:
                 logger.warning(
-                    "Layerwise offload requested but model %s does not have "
-                    "nn.ModuleList structure. Skipping layerwise offload.",
+                    "Layerwise offload requested but model "
+                    "%s does not have nn.ModuleList "
+                    "structure. Skipping layerwise offload.",
                     cls_name
                 )
         return model

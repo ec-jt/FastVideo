@@ -668,11 +668,40 @@ class FastVideoArgs:
                     "dit_layerwise_offload is enabled, automatically disabling use_fsdp_inference."
                 )
                 self.use_fsdp_inference = False
-            if self.dit_cpu_offload:
-                logger.warning(
-                    "dit_layerwise_offload is enabled, automatically disabling dit_cpu_offload."
+            # Keep dit_cpu_offload=True when layerwise offload is
+            # enabled — it tells the loader to place weights on CPU
+            # during initial loading, which is required when the
+            # model is larger than GPU VRAM.  The layerwise hooks
+            # will then stream blocks to GPU on demand.
+            if not self.dit_cpu_offload:
+                logger.info(
+                    "dit_layerwise_offload is enabled, "
+                    "automatically enabling dit_cpu_offload "
+                    "for CPU-based weight loading."
                 )
-                self.dit_cpu_offload = False
+                self.dit_cpu_offload = True
+
+        # Log active offloading configuration
+        if self.dit_layerwise_offload:
+            offload_mode = "layerwise (FastVideo custom hooks)"
+        elif self.use_fsdp_inference and self.dit_cpu_offload:
+            offload_mode = "FSDP2 + CPU offload (PyTorch native)"
+        elif self.use_fsdp_inference:
+            offload_mode = "FSDP2 inference (no CPU offload)"
+        elif self.dit_cpu_offload:
+            offload_mode = "bulk CPU offload (whole model .to())"
+        else:
+            offload_mode = "none (all weights on GPU)"
+        logger.info(
+            "Offload config: transformer=%s, "
+            "text_encoder_cpu_offload=%s, "
+            "vae_cpu_offload=%s, "
+            "pin_cpu_memory=%s",
+            offload_mode,
+            self.text_encoder_cpu_offload,
+            self.vae_cpu_offload,
+            self.pin_cpu_memory,
+        )
 
         # Validate mode and inference_mode consistency
         assert isinstance(

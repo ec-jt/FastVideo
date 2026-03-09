@@ -17,6 +17,13 @@ Usage:
     python tests/helix/test_ltx2_audio_quality.py \
         --model-path /mnt/nvme0/models/FastVideo/LTX2.3-Distilled-Diffusers \
         --num-gpus 8 --tp-size 8 --enhance-prompt
+
+    # Keep-alive: generate same prompt twice back-to-back
+    # (proves pipeline stays warm — no reload between requests):
+    LTX2_TWO_STAGE=1 python tests/helix/test_ltx2_audio_quality.py \
+        --model-path /mnt/nvme0/models/FastVideo/LTX2.3-Distilled-Diffusers \
+        --num-gpus 1 --tp-size 1 --frames 241 \
+        --prompt-id singer_spotlight --repeat 2
 """
 
 import argparse
@@ -211,6 +218,7 @@ def run_audio_quality_tests(
     prompt_ids: list[str] | None = None,
     num_inference_steps: int | None = None,
     guidance_scale: float | None = None,
+    repeat: int = 1,
 ) -> list[TestResult]:
     """Run test prompts and collect results.
 
@@ -355,8 +363,8 @@ def run_audio_quality_tests(
         num_gpus=num_gpus,
         tp_size=tp_size,
         sp_size=1,
-        use_fsdp_inference=True,
-        dit_layerwise_offload=False,
+        use_fsdp_inference=False,
+        dit_layerwise_offload=True,
     )
     load_time = time.time() - load_start
     print(f"Model loaded in {load_time:.2f}s")
@@ -450,6 +458,103 @@ def run_audio_quality_tests(
             traceback.print_exc()
 
         results.append(result)
+
+    # ── Keep-alive: repeat generation to prove pipeline
+    # stays warm (no reload between requests) ──────────
+    if repeat > 1:
+        for rep in range(2, repeat + 1):
+            print(f"\n{'━' * 70}")
+            print(
+                f"KEEP-ALIVE REPEAT {rep}/{repeat} "
+                "(pipeline stays warm — no reload)"
+            )
+            print(f"{'━' * 70}")
+
+            for i, test in enumerate(prompts_to_run):
+                prompt_id = test["id"]
+                category = test["category"]
+                prompt = test["prompt"]
+                enhanced = None
+
+                # Use pre-enhanced prompt if available
+                if prompt_id in enhanced_prompts:
+                    enhanced = enhanced_prompts[prompt_id]
+                    prompt = enhanced
+
+                run_label = f"{prompt_id}_r{rep}"
+                print(f"\n{'─' * 70}")
+                print(
+                    f"[repeat {rep}, "
+                    f"{i+1}/{len(prompts_to_run)}] "
+                    f"{prompt_id} ({category})"
+                )
+
+                try:
+                    gen_start = time.time()
+                    video = generator.generate_video(
+                        prompt=prompt,
+                        num_frames=num_frames,
+                        height=height,
+                        width=width,
+                        seed=seed + rep,
+                        guidance_scale=guidance_scale,
+                        num_inference_steps=num_inference_steps,
+                    )
+                    gen_time = time.time() - gen_start
+                    peak_mem = get_peak_memory()
+
+                    output_files = sorted(
+                        Path("outputs").glob("*.mp4"),
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                    output_path = (
+                        str(output_files[0])
+                        if output_files else None
+                    )
+
+                    if output_path:
+                        suffix = "_enhanced" if enhance_prompt else ""
+                        dest = os.path.join(
+                            output_dir,
+                            f"{prompt_id}{suffix}_r{rep}.mp4",
+                        )
+                        import shutil
+                        shutil.copy2(output_path, dest)
+                        output_path = dest
+
+                    result = TestResult(
+                        prompt_id=run_label,
+                        category=category,
+                        prompt=prompt,
+                        enhanced_prompt=enhanced,
+                        status="passed",
+                        generation_time_seconds=gen_time,
+                        peak_memory_mb=peak_mem,
+                        output_path=output_path,
+                    )
+                    print(
+                        f"✅ {run_label}: {gen_time:.1f}s, "
+                        f"{peak_mem} MB → {output_path}"
+                    )
+
+                except Exception as e:
+                    result = TestResult(
+                        prompt_id=run_label,
+                        category=category,
+                        prompt=prompt,
+                        enhanced_prompt=enhanced,
+                        status="failed",
+                        generation_time_seconds=None,
+                        peak_memory_mb=None,
+                        output_path=None,
+                        error=str(e),
+                    )
+                    print(f"❌ {run_label}: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+                results.append(result)
 
     # Shutdown
     generator.shutdown()
@@ -557,11 +662,13 @@ def main():
     parser.add_argument(
         "--custom-prompt",
         type=str,
+        nargs="+",
         default=None,
         help=(
-            "Run a single custom prompt instead of the "
-            "built-in test prompts. "
-            "Example: --custom-prompt 'A cat playing piano'"
+            "Run one or more custom prompts instead of "
+            "the built-in test prompts. "
+            "Example: --custom-prompt 'A cat playing piano' "
+            "'A dog surfing at sunset'"
         ),
     )
     parser.add_argument(
@@ -582,17 +689,32 @@ def main():
             "Default: 1.0 for distilled, 3.0 for dev."
         ),
     )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help=(
+            "Generate each prompt N times back-to-back "
+            "using the same pipeline (keep-alive). "
+            "Proves zero-reload between requests. "
+            "Default: 1 (no repeat)."
+        ),
+    )
     args = parser.parse_args()
 
-    # If custom prompt provided, inject it as a test prompt
+    # If custom prompt(s) provided, inject them as test prompts
     prompt_ids = args.prompt_id
     if args.custom_prompt:
-        TEST_PROMPTS.insert(0, {
-            "id": "custom",
-            "category": "custom",
-            "prompt": args.custom_prompt,
-        })
-        prompt_ids = ["custom"]
+        custom_ids = []
+        for idx, cp in enumerate(args.custom_prompt):
+            cid = f"custom_{idx}" if len(args.custom_prompt) > 1 else "custom"
+            TEST_PROMPTS.insert(idx, {
+                "id": cid,
+                "category": "custom",
+                "prompt": cp,
+            })
+            custom_ids.append(cid)
+        prompt_ids = custom_ids
 
     results = run_audio_quality_tests(
         model_path=args.model_path,
@@ -607,6 +729,7 @@ def main():
         prompt_ids=prompt_ids,
         num_inference_steps=args.steps,
         guidance_scale=args.guidance_scale,
+        repeat=args.repeat,
     )
 
     print_summary(results)
