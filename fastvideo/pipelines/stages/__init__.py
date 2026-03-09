@@ -31,6 +31,18 @@ from fastvideo.pipelines.stages.ltx2_audio_decoding import LTX2AudioDecodingStag
 from fastvideo.pipelines.stages.ltx2_denoising import LTX2DenoisingStage
 from fastvideo.pipelines.stages.ltx2_distilled_denoising import (
     LTX2DistilledDenoisingStage)
+from fastvideo.pipelines.stages.ltx2_two_stage_denoising import (
+    LTX2TwoStageDenoisingStage)
+from fastvideo.pipelines.stages.ltx2_hq_denoising import (
+    LTX2HQDenoisingStage)
+from fastvideo.pipelines.stages.ltx2_a2v_denoising import (
+    LTX2A2VDenoisingStage)
+from fastvideo.pipelines.stages.ltx2_retake_denoising import (
+    LTX2RetakeDenoisingStage)
+from fastvideo.pipelines.stages.ltx2_keyframe_denoising import (
+    LTX2KeyframeDenoisingStage)
+from fastvideo.pipelines.stages.ltx2_ic_lora_denoising import (
+    LTX2ICLoraDenoisingStage)
 from fastvideo.pipelines.stages.ltx2_latent_preparation import (
     LTX2LatentPreparationStage)
 from fastvideo.pipelines.stages.ltx2_text_encoding import LTX2TextEncodingStage
@@ -75,6 +87,12 @@ __all__ = [
     "Cosmos25AutoDenoisingStage",
     "LTX2DenoisingStage",
     "LTX2DistilledDenoisingStage",
+    "LTX2TwoStageDenoisingStage",
+    "LTX2HQDenoisingStage",
+    "LTX2A2VDenoisingStage",
+    "LTX2RetakeDenoisingStage",
+    "LTX2KeyframeDenoisingStage",
+    "LTX2ICLoraDenoisingStage",
     "LTX2TextEncodingStage",
     "SRDenoisingStage",
     "EncodingStage",

@@ -64,7 +64,9 @@ from fastvideo.configs.sample.lingbotworld import LingBotWorld_SamplingParam
 from fastvideo.configs.sample.ltx2 import (LTX2BaseSamplingParam,
                                            LTX2DistilledSamplingParam,
                                            LTX23BaseSamplingParam,
-                                           LTX23DistilledSamplingParam)
+                                           LTX23DistilledSamplingParam,
+                                           LTX23TwoStageSamplingParam,
+                                           LTX23HQSamplingParam)
 from fastvideo.configs.sample.turbodiffusion import (
     TurboDiffusionI2V_A14B_SamplingParam,
     TurboDiffusionT2V_14B_SamplingParam,

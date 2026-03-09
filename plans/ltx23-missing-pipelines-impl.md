@@ -448,13 +448,160 @@ graph TD
 
 ---
 
+## Upstream Optimization & Compatibility Notes
+
+> Source: `/home/ubuntu/LTX-2/packages/ltx-pipelines/README.md`
+
+### Pipeline Selection Guide (from upstream)
+
+```text
+Do you have an existing video to modify?
+├─ YES → Use RetakePipeline (regenerate a specific time region)
+│
+Do you have an audio file to drive generation?
+├─ YES → Use A2VidPipelineTwoStage (audio-to-video)
+│
+Do you need to condition on existing images/videos?
+├─ YES → Do you have reference videos for video-to-video?
+│  ├─ YES → Use ICLoraPipeline
+│  └─ NO → Do you have multiple keyframe images to interpolate?
+│     ├─ YES → Use KeyframeInterpolationPipeline
+│     └─ NO → Use TI2VidTwoStagesPipeline (image conditioning only)
+│
+└─ NO → Text-to-video only
+   ├─ Do you need best quality?
+   │  └─ YES → Use TI2VidTwoStagesPipeline (recommended for production)
+   │
+   └─ Do you need fastest inference?
+      └─ YES → Use DistilledPipeline (with 8 predefined sigmas)
+```
+
+> **Note from upstream:** `TI2VidOneStagePipeline` is primarily for educational
+> purposes. For best quality, use two-stage pipelines. For editing existing
+> videos, use `RetakePipeline`.
+
+### Features Comparison (from upstream)
+
+| Pipeline | Stages | Multimodal Guidance | Upsampling | Conditioning | Best For |
+|----------|--------|---------------------|------------|-------------|----------|
+| **TI2VidTwoStagesPipeline** | 2 | ✅ | ✅ | Image | **Production quality** (recommended) |
+| **TI2VidTwoStagesHQPipeline** | 2 | ✅ | ✅ | Image | Same, res_2s sampler (higher quality) |
+| **TI2VidOneStagePipeline** | 1 | ✅ | ❌ | Image | Educational, prototyping |
+| **DistilledPipeline** | 2 | ❌ | ✅ | Image | Fastest inference (8 sigmas) |
+| **ICLoraPipeline** | 2 | ✅ | ✅ | Image + Video | Video-to-video transformations |
+| **KeyframeInterpolationPipeline** | 2 | ✅ | ✅ | Keyframes | Animation, interpolation |
+| **A2VidPipelineTwoStage** | 2 | ✅ | ✅ | Audio + Image | Audio-driven video generation |
+| **RetakePipeline** | 1 | ✅ | ❌ | Source Video | Regenerating a time region |
+
+### Multimodal Guidance Parameters
+
+Each modality (video, audio) has independent guidance parameters:
+
+| Parameter | Description | Typical Values |
+|-----------|-------------|----------------|
+| `cfg_scale` | Classifier-Free Guidance scale. Higher = stronger prompt adherence. | 2.0–5.0 (1.0 = disabled) |
+| `stg_scale` | Spatio-Temporal Guidance scale. Improves temporal coherence. | 0.5–1.5 (0.0 = disabled) |
+| `stg_blocks` | Which transformer blocks to perturb for STG. | `[28]` for LTX-2.3, `[29]` for LTX-2.0 |
+| `rescale_scale` | Rescales guided prediction to match conditional variance. Prevents over-saturation. | 0.5–0.7 (0.0 = disabled) |
+| `modality_scale` | Modality CFG scale. Improves audio-visual sync. | 3.0 (1.0 = disabled) |
+| `skip_step` | Skip guidance every N steps. Speeds up inference. | 0 = never skip |
+
+> **Tip:** Higher `cfg_scale` = stronger prompt adherence but potentially less
+> natural motion. Higher `stg_scale` = better temporal coherence but slower
+> (requires extra forward passes). Set `modality_scale > 1.0` for audio-video
+> sync; set to 1.0 for video-only.
+
+### Denoising Loop Optimization: Gradient Estimation
+
+The upstream provides a `gradient_estimating_euler_denoising_loop` that allows
+**20-30 steps instead of 40** while maintaining quality:
+
+```python
+# From ltx_pipelines/utils/samplers.py
+def gradient_estimating_euler_denoising_loop(
+    sigmas, video_state, audio_state, stepper, denoise_fn,
+    ge_gamma=2.0,  # Gradient estimation coefficient
+) -> tuple[LatentState, LatentState]:
+```
+
+This tracks velocity changes across steps and applies a correction term.
+Paper: https://openreview.net/pdf?id=o2ND9v0CeK
+
+**FastVideo implementation note:** This should be added as an alternative
+denoising loop option in the Two-Stage T2V and HQ pipelines. Can be
+controlled via a `use_gradient_estimation: bool` parameter in sampling config.
+
+### FP8 Quantization Support
+
+Two quantization policies are available upstream:
+
+| Policy | Description | GPU Requirement |
+|--------|-------------|-----------------|
+| **FP8 Cast** | Downcasts transformer linear weights to FP8 during loading; upcasts on the fly. | Any GPU with FP8 support |
+| **FP8 Scaled MM** | Uses FP8 scaled matrix multiplication via TensorRT-LLM. | Hopper GPUs (H100, etc.) |
+
+> **Note:** Requires `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
+> FastVideo already has FP8 support infrastructure — see `plans/ltx-2.3-fp8-support.md`.
+
+### Memory Cleanup Between Stages
+
+Upstream pipelines clean GPU memory (especially transformer weights) between
+stages to reduce peak VRAM. The pattern is:
+```python
+torch.cuda.synchronize()
+del transformer
+cleanup_memory()  # gc.collect() + torch.cuda.empty_cache() + synchronize()
+```
+
+FastVideo's existing distilled pipeline already does this with upsampler
+offloading. New pipelines should follow the same pattern.
+
+### Image Conditioning Types (from upstream)
+
+Two conditioning methods are used across pipelines:
+
+1. **Replacing Latents** (`VideoConditionByLatentIndex`):
+   - Used by: TI2VidTwoStages, Distilled, ICLora (for frame 0)
+   - **Replaces** the latent at a specific frame with the encoded image
+   - Strong control over specific frames
+
+2. **Guiding Latents** (`VideoConditionByKeyframeIndex`):
+   - Used by: KeyframeInterpolation (for ALL frames), TI2VidTwoStages (for non-zero frames)
+   - **Appends** the image as a guiding signal rather than replacing
+   - Better for smooth interpolation between keyframes
+
+### Retake Pipeline Constraints
+
+- Source video frame count must satisfy **8k+1** format (e.g., 97, 193)
+- Resolution must be **multiples of 32**
+- Supports independent `regenerate_video` and `regenerate_audio` flags
+
+### IC-LoRA Compatibility
+
+- Can **only** be used with a distilled model checkpoint
+- Supports `reference_downscale_factor` from LoRA metadata
+- Supports pixel-space attention masks downsampled to latent space
+
+### Required Weight Files Summary
+
+| Weight File | Used By | Notes |
+|-------------|---------|-------|
+| LTX-2.3 Dev checkpoint | Pipelines 1-5 | Non-distilled base model |
+| LTX-2.3 Distilled checkpoint | Pipelines 4 (distilled mode), 6 | Distilled model |
+| Distilled LoRA weights | Pipelines 1-3, 5 | Applied to Dev model for Stage 2 |
+| Spatial upsampler weights | All two-stage pipelines | ~1GB in bf16 |
+| IC-LoRA weights | Pipeline 6 only | Specific to control type (depth/pose/edges) |
+| Gemma text encoder | All pipelines | Shared text encoder |
+
+---
+
 ## Files Summary
 
 ### New Files (20 files)
 | File | Phase |
 |------|-------|
 | `fastvideo/models/schedulers/res2s.py` | 1 |
-| `fastvideo/pipelines/stages/ltx2_two_stage_base.py` | 1 |
+| `fastvideo/pipelines/stages/ltx2_stage_utils.py` | 1 |
 | `fastvideo/pipelines/stages/ltx2_two_stage_denoising.py` | 2 |
 | `fastvideo/pipelines/basic/ltx2/ltx2_two_stage_pipeline.py` | 2 |
 | `examples/inference/basic/basic_ltx2_two_stage.py` | 2 |
@@ -474,13 +621,12 @@ graph TD
 | `examples/inference/basic/basic_ltx2_a2v.py` | 8 |
 | `examples/inference/basic/basic_ltx2_retake.py` | 8 |
 
-### Modified Files (4 files)
+### Modified Files (3 files — NO refactoring of existing working code)
 | File | Changes |
 |------|---------|
 | `fastvideo/pipelines/stages/__init__.py` | Add exports for all new stages |
 | `fastvideo/configs/sample/ltx2.py` | Add `LTX23TwoStageSamplingParam`, update `LTX23HQSamplingParam` |
 | `fastvideo/pipelines/pipeline_batch_info.py` | Add fields: `audio_path`, `video_path`, `retake_*`, keyframe fields |
-| `fastvideo/pipelines/stages/ltx2_distilled_denoising.py` | Refactor to extend `LTX2TwoStageBaseDenoisingStage` |
 
 ### Upstream Reference Files
 | Upstream File | FastVideo Equivalent |
@@ -492,5 +638,5 @@ graph TD
 | `ltx_pipelines/keyframe_interpolation.py` | `ltx2_keyframe_pipeline.py` + `ltx2_keyframe_denoising.py` |
 | `ltx_pipelines/ic_lora.py` | `ltx2_ic_lora_pipeline.py` + `ltx2_ic_lora_denoising.py` |
 | `ltx_pipelines/utils/res2s.py` | `fastvideo/models/schedulers/res2s.py` |
-| `ltx_pipelines/utils/samplers.py` | Integrated into denoising stages |
+| `ltx_pipelines/utils/samplers.py` | Integrated into denoising stages + `ltx2_stage_utils.py` |
 | `ltx_core/components/diffusion_steps.py` | `fastvideo/models/schedulers/res2s.py` |

@@ -151,18 +151,57 @@ class LTX23DistilledSamplingParam(SamplingParam):
 
 
 @dataclass
-class LTX23HQSamplingParam(SamplingParam):
-    """Default sampling parameters for LTX-2.3 HQ two-stage pipeline.
+class LTX23TwoStageSamplingParam(SamplingParam):
+    """Default sampling parameters for LTX-2.3 two-stage T2V pipeline.
 
-    Used for high-quality generation with spatial upscaling.
-    Stage 1 generates at half resolution, then upscaled in stage 2.
+    Stage 1 generates at half resolution with CFG guidance (30 steps).
+    Stage 2 refines at full resolution with distilled LoRA (3 steps).
+
+    The height/width here are the FULL (stage 2) resolution.
+    Stage 1 automatically uses half of these values.
     """
 
     seed: int = 10
     num_frames: int = 121
-    # Stage 1 resolution (half of final 1920x1088)
-    height: int = 544  # 1088 // 2
-    width: int = 960   # 1920 // 2
+    # Full (stage 2) resolution — stage 1 uses half
+    height: int = 1024
+    width: int = 1536
+    fps: int = 24
+    num_inference_steps: int = 30
+    guidance_scale: float = 3.0
+    negative_prompt: str = DEFAULT_LTX_NEGATIVE_PROMPT
+    # Official LTX-2.3 multi-modal CFG defaults.
+    ltx2_cfg_scale_video: float = 3.0
+    ltx2_cfg_scale_audio: float = 7.0
+    ltx2_modality_scale_video: float = 3.0
+    ltx2_modality_scale_audio: float = 3.0
+    ltx2_rescale_scale: float = 0.7
+    # STG defaults from official LTX-2.3.
+    ltx2_stg_scale_video: float = 1.0
+    ltx2_stg_scale_audio: float = 1.0
+    ltx2_stg_blocks_video: list[int] = field(
+        default_factory=lambda: [28])
+    ltx2_stg_blocks_audio: list[int] = field(
+        default_factory=lambda: [28])
+
+
+@dataclass
+class LTX23HQSamplingParam(SamplingParam):
+    """Default sampling parameters for LTX-2.3 HQ two-stage pipeline.
+
+    Used for high-quality generation with Res2s sampler and spatial
+    upscaling.  Stage 1 generates at half resolution, then upscaled
+    in stage 2.  Both stages use distilled LoRA at configurable
+    per-stage strengths.
+
+    The height/width here are the FULL (stage 2) resolution.
+    """
+
+    seed: int = 10
+    num_frames: int = 121
+    # Full (stage 2) resolution — stage 1 uses half
+    height: int = 1088
+    width: int = 1920
     fps: int = 24
     num_inference_steps: int = 15
     guidance_scale: float = 3.0
@@ -178,6 +217,9 @@ class LTX23HQSamplingParam(SamplingParam):
     ltx2_stg_scale_audio: float = 0.0
     ltx2_stg_blocks_video: list[int] = field(default_factory=list)
     ltx2_stg_blocks_audio: list[int] = field(default_factory=list)
+    # Per-stage LoRA strength control
+    distilled_lora_strength_stage_1: float = 0.25
+    distilled_lora_strength_stage_2: float = 0.5
 
 
 @dataclass
