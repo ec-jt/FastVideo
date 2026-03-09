@@ -709,18 +709,33 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
+        import fastvideo.envs as envs
+
         model = self.gemma_model
-        orig_device = model.device
         model.to(device=get_local_torch_device())
-        # input_ids = input_ids.to(device=model.device)
-        # attention_mask = attention_mask.to(device=model.device)
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
             return_dict=True,
         )
-        model.to(device=orig_device)
+
+        # Conditional offload controlled by GEMMA_PREFETCH_MODE:
+        #   "off" (default) — offload to CPU immediately (current
+        #       behaviour, safe for memory-constrained setups).
+        #   "keep_on_gpu" — leave Gemma on GPU permanently.
+        #   "prefetch_during_upsample" — offload now; the denoising
+        #       stage will prefetch Gemma back to GPU asynchronously
+        #       during the upsample step so it is ready for the next
+        #       request's text encoding.
+        prefetch_mode = envs.GEMMA_PREFETCH_MODE
+        if prefetch_mode == "keep_on_gpu":
+            pass  # stay on GPU
+        else:
+            # Both "off" and "prefetch_during_upsample" offload here.
+            # In "prefetch_during_upsample" mode the denoising stage
+            # will move Gemma back to GPU during the upsample step.
+            model.to(device="cpu")
         
         encoded_inputs, audio_encoded_inputs = self._run_feature_extractor(
             outputs.hidden_states,

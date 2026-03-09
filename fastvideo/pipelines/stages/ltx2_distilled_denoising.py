@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+ # SPDX-License-Identifier: Apache-2.0
 """
 LTX-2 distilled two-stage denoising stage.
 
@@ -14,6 +14,7 @@ This matches the official ``DistilledPipeline`` from:
 from __future__ import annotations
 
 import os
+import threading
 
 import torch
 from tqdm.auto import tqdm
@@ -570,6 +571,14 @@ class LTX2DistilledDenoisingStage(PipelineStage):
         self.per_channel_statistics.to("cpu")
         torch.cuda.empty_cache()
 
+        # ── Async Gemma prefetch for next request ────
+        # Start moving Gemma to GPU in a background thread
+        # while we prepare Stage 2.  By the time the next
+        # request's text encoding runs, Gemma is already
+        # on GPU — saving ~10 s of CPU→GPU transfer.
+        if envs.GEMMA_PREFETCH_MODE == "prefetch_during_upsample":
+            self._async_prefetch_gemma(batch, device)
+
         _debug_save_latent(upsampled_latents, "upsampled")
         _debug_decode_and_save(
             upsampled_latents, self._debug_vae,
@@ -658,6 +667,60 @@ class LTX2DistilledDenoisingStage(PipelineStage):
 
         batch.latents = stage_2_latents
         batch.extra["ltx2_audio_latents"] = audio_latents
+
+    # ─────────────────────────────────────────────────────────
+    # Gemma prefetch helper
+    # ─────────────────────────────────────────────────────────
+
+    def _async_prefetch_gemma(
+        self,
+        batch: ForwardBatch,
+        device: torch.device,
+    ) -> None:
+        """Move Gemma to GPU asynchronously in a background thread.
+
+        This overlaps the CPU→GPU transfer (~5-13 s for 18 GB)
+        with Stage 2 preparation and execution, so that the next
+        request's text encoding finds Gemma already on GPU.
+
+        The reference is obtained from ``batch.extra["_gemma_model_ref"]``
+        which is set by :class:`TextEncodingStage`.
+        """
+        gemma = batch.extra.get("_gemma_model_ref")
+        if gemma is None:
+            logger.debug(
+                "[Gemma-prefetch] No _gemma_model_ref in batch; "
+                "skipping prefetch.")
+            return
+
+        # Already on the target device — nothing to do.
+        if next(gemma.parameters()).device == device:
+            logger.debug(
+                "[Gemma-prefetch] Gemma already on %s; "
+                "skipping prefetch.", device)
+            return
+
+        def _prefetch() -> None:
+            try:
+                logger.info(
+                    "[Gemma-prefetch] Moving Gemma to %s "
+                    "in background thread …", device)
+                gemma.to(device=device)
+                logger.info(
+                    "[Gemma-prefetch] Gemma now on %s.",
+                    device)
+            except Exception:
+                logger.warning(
+                    "[Gemma-prefetch] Background prefetch "
+                    "failed; Gemma will be loaded on next "
+                    "forward() call.",
+                    exc_info=True,
+                )
+
+        thread = threading.Thread(
+            target=_prefetch, daemon=True)
+        thread.start()
+        # Don't join — let it run in background during Stage 2.
 
     # ─────────────────────────────────────────────────────────
     # Single-stage fallback

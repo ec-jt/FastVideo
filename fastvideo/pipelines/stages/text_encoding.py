@@ -8,6 +8,7 @@ This module contains implementations of prompt encoding stages for diffusion pip
 import torch
 from typing import Any
 
+import fastvideo.envs as envs
 from fastvideo.distributed import get_local_torch_device
 from fastvideo.fastvideo_args import FastVideoArgs
 from fastvideo.forward_context import set_forward_context
@@ -96,6 +97,16 @@ class TextEncodingStage(PipelineStage):
             if batch.negative_attention_mask is not None:
                 for nm in neg_masks_list:
                     batch.negative_attention_mask.append(nm)
+
+        # Store a reference to the Gemma model so the denoising
+        # stage can prefetch it back to GPU during the upsample
+        # step (see GEMMA_PREFETCH_MODE).
+        if envs.GEMMA_PREFETCH_MODE != "off":
+            for enc in self.text_encoders:
+                gemma = getattr(enc, "_gemma_model", None)
+                if gemma is not None:
+                    batch.extra["_gemma_model_ref"] = gemma
+                    break
 
         return batch
 

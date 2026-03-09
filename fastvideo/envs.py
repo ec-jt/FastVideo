@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     FASTVIDEO_STAGE_LOGGING: bool = False
     FASTVIDEO_HOST_IP: str = ""
     FASTVIDEO_LOOPBACK_IP: str = ""
+    GEMMA_PREFETCH_MODE: str = "off"
 
 
 def get_default_cache_root() -> str:
@@ -267,6 +268,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # taken for each stage
     "FASTVIDEO_STAGE_LOGGING":
     lambda: bool(int(os.getenv("FASTVIDEO_STAGE_LOGGING", "0"))),
+
+    # Controls Gemma text encoder GPU residency for back-to-back requests.
+    # "off" (default): offload Gemma to CPU after each forward pass.
+    # "keep_on_gpu": keep Gemma on GPU permanently after first load.
+    # "prefetch_during_upsample": offload after text encoding, then
+    #   prefetch back to GPU asynchronously during the upsample step
+    #   of the two-stage distilled pipeline.
+    "GEMMA_PREFETCH_MODE":
+    lambda: os.getenv("GEMMA_PREFETCH_MODE", "off"),
 }
 
 # end-env-vars-definition
