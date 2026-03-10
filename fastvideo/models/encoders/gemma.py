@@ -736,6 +736,10 @@ class LTX2GemmaTextEncoderModel(TextEncoder):
             # In "prefetch_during_upsample" mode the denoising stage
             # will move Gemma back to GPU during the upsample step.
             model.to(device="cpu")
+            # Release the ~18GB of cached CUDA allocations so the
+            # next pipeline stage (denoising) has room for activations
+            # and transformer block weights.
+            torch.cuda.empty_cache()
         
         encoded_inputs, audio_encoded_inputs = self._run_feature_extractor(
             outputs.hidden_states,

@@ -269,6 +269,7 @@ class DecodingStage(PipelineStage):
 
         if fastvideo_args.vae_cpu_offload:
             self.vae.to("cpu")
+            torch.cuda.empty_cache()
 
         if torch.backends.mps.is_available():
             del self.vae

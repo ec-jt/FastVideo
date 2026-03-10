@@ -42,6 +42,19 @@ from fastvideo.utils import is_vsa_available
 
 logger = init_logger(__name__)
 
+
+def _log_gpu_memory(label: str) -> None:
+    """Log current GPU memory usage at a pipeline transition."""
+    if not torch.cuda.is_available():
+        return
+    alloc = torch.cuda.memory_allocated() / (1024**3)
+    reserved = torch.cuda.memory_reserved() / (1024**3)
+    logger.info(
+        "[GPU-Mem] %s: allocated=%.2f GB, reserved=%.2f GB",
+        label, alloc, reserved,
+    )
+
+
 # Debug output directory (set LTX2_DEBUG_DIR env var to enable)
 _DEBUG_DIR = os.environ.get("LTX2_DEBUG_DIR", "")
 
@@ -422,6 +435,8 @@ class LTX2DistilledDenoisingStage(PipelineStage):
                 "LTX2_TWO_STAGE", "0") == "1"
         )
 
+        _log_gpu_memory("denoising-start")
+
         if use_two_stage:
             # ─── Two-stage pipeline (experimental) ────────
             logger.info(
@@ -452,6 +467,7 @@ class LTX2DistilledDenoisingStage(PipelineStage):
                 fastvideo_args=fastvideo_args,
             )
 
+        _log_gpu_memory("denoising-done")
         logger.info("[LTX2-Distilled] Denoising done.")
         return batch
 
@@ -570,6 +586,7 @@ class LTX2DistilledDenoisingStage(PipelineStage):
         self.spatial_upsampler.to("cpu")
         self.per_channel_statistics.to("cpu")
         torch.cuda.empty_cache()
+        _log_gpu_memory("after-upsample-offload")
 
         # ── Async Gemma prefetch for next request ────
         # Start moving Gemma to GPU in a background thread
@@ -597,6 +614,7 @@ class LTX2DistilledDenoisingStage(PipelineStage):
             dtype=torch.float32,
         )
 
+        _log_gpu_memory("before-stage2")
         logger.info(
             "[LTX2-Distilled] Stage 2: full-res %dx%d "
             "(%d steps, start_sigma=%.6f)",

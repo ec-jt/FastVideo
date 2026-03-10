@@ -6,6 +6,7 @@ This module provides a consolidated interface for generating videos using
 diffusion models.
 """
 
+import gc
 import os
 import re
 import threading
@@ -461,6 +462,15 @@ class VideoGenerator:
             "video_path": output_path if batch.save_video else None,
             "peak_memory_mb": output_batch.extra.get("peak_memory_mb"),
         }
+
+        # Release GPU tensors from the pipeline output now that all
+        # data has been extracted to CPU.  This frees the large
+        # activation / latent caches that would otherwise prevent
+        # the next request from loading Gemma (~18 GB) onto the GPU.
+        del output_batch
+        del result_container
+        gc.collect()
+        torch.cuda.empty_cache()
 
         return result
 

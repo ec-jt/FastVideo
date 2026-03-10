@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import gc
 import os
 from typing import Any, cast
 
@@ -77,7 +78,19 @@ class Worker:
 
     def execute_forward(self, forward_batch: ForwardBatch,
                         fastvideo_args: FastVideoArgs) -> ForwardBatch:
-        output_batch = self.pipeline.forward(forward_batch, self.fastvideo_args)
+        try:
+            output_batch = self.pipeline.forward(
+                forward_batch, self.fastvideo_args)
+        except torch.cuda.OutOfMemoryError:
+            logger.warning(
+                "CUDA OOM during forward pass — clearing cache "
+                "and retrying once",
+                local_main_process_only=False,
+            )
+            gc.collect()
+            torch.cuda.empty_cache()
+            output_batch = self.pipeline.forward(
+                forward_batch, self.fastvideo_args)
         return cast(ForwardBatch, output_batch)
 
     def shutdown(self) -> dict[str, Any]:
