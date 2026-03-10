@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import gc
 from dataclasses import dataclass
 from enum import Enum
 import faulthandler
@@ -663,6 +664,13 @@ class WorkerMultiprocProc:
                             "extra": output_batch.extra,
                             "peak_memory_mb": peak_memory_mb,
                         })
+                        # Release GPU memory held by pipeline
+                        # intermediates (activations, latents,
+                        # etc.) so the next request can load
+                        # Gemma (~18 GB) without OOM.
+                        del output_batch, result
+                        gc.collect()
+                        torch.cuda.empty_cache()
                     else:
                         result = self.worker.execute_method(
                             method, *args, **kwargs)

@@ -84,9 +84,7 @@ class Worker:
         except torch.cuda.OutOfMemoryError:
             logger.warning(
                 "CUDA OOM during forward pass — clearing cache "
-                "and retrying once",
-                local_main_process_only=False,
-            )
+                "and retrying once")
             gc.collect()
             torch.cuda.empty_cache()
             output_batch = self.pipeline.forward(
