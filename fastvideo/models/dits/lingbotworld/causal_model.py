@@ -506,21 +506,44 @@ class CausalLingBotWorldTransformer3DModel(BaseDiT):
         post_patch_width = width // p_w
         frame_seqlen = post_patch_height * post_patch_width
 
-        # Rotary embeddings with absolute start frame offset
-        d = self.hidden_size // self.num_attention_heads
-        rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
-        freqs_cos, freqs_sin = get_rotary_pos_embed(
-            (post_patch_num_frames, post_patch_height, post_patch_width),
-            self.hidden_size,
-            self.num_attention_heads,
-            rope_dim_list,
-            dtype=(torch.float32
-                   if current_platform.is_mps() else torch.float64),
-            rope_theta=10000,
-            start_frame=start_frame,
-        )
-        freqs_cos = freqs_cos.to(hidden_states.device)
-        freqs_sin = freqs_sin.to(hidden_states.device)
+        # Rotary embeddings with absolute start frame offset. The table
+        # is generated in float64 for accuracy but CACHED and applied in
+        # float32: leaving cos/sin in float64 silently promotes the
+        # whole RoPE apply over q/k to double precision every forward
+        # (~7% of GPU time in the nsys profile).
+        rope_key = (post_patch_num_frames, post_patch_height,
+                    post_patch_width, int(start_frame))
+        rope_cache = getattr(self, "_rope_cache", None)
+        if rope_cache is None:
+            rope_cache = {}
+            self._rope_cache = rope_cache
+        cached = rope_cache.get(rope_key)
+        if cached is None:
+            d = self.hidden_size // self.num_attention_heads
+            rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
+            freqs_cos, freqs_sin = get_rotary_pos_embed(
+                (post_patch_num_frames, post_patch_height,
+                 post_patch_width),
+                self.hidden_size,
+                self.num_attention_heads,
+                rope_dim_list,
+                dtype=(torch.float32
+                       if current_platform.is_mps() else torch.float64),
+                rope_theta=10000,
+                start_frame=start_frame,
+            )
+            freqs_cos = freqs_cos.to(device=hidden_states.device,
+                                     dtype=torch.float32)
+            freqs_sin = freqs_sin.to(device=hidden_states.device,
+                                     dtype=torch.float32)
+            # Bounded cache: chunked generation revisits few distinct
+            # (shape, start_frame) keys, but guard against unbounded
+            # growth in long interactive sessions.
+            if len(rope_cache) > 64:
+                rope_cache.clear()
+            rope_cache[rope_key] = (freqs_cos, freqs_sin)
+        else:
+            freqs_cos, freqs_sin = cached
         freqs_cis = (freqs_cos, freqs_sin)
 
         hidden_states = self.patch_embedding(hidden_states)
