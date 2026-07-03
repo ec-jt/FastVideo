@@ -305,6 +305,18 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
                 start_index += current_num_frames
 
         batch.latents = latents
+
+        # The KV caches for a 21-latent-frame rollout are multi-GB
+        # (13.4GB fp8 / 26.8GB bf16); free them eagerly so back-to-back
+        # generations do not OOM while the previous run's caches are
+        # still referenced by this frame's locals.
+        for entry in kv_cache:
+            entry.clear()
+        for entry in crossattn_cache:
+            entry.clear()
+        del kv_cache, crossattn_cache, y
+        torch.cuda.empty_cache()
+
         return batch
 
 
