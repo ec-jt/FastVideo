@@ -371,7 +371,16 @@ def load_model_from_full_model_state_dict(
                 f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
             )
         if not hasattr(meta_sharded_param, "device_mesh"):
-            full_tensor = full_tensor.to(device=device, dtype=param_dtype)
+            # When cpu_offload is requested without FSDP (e.g. for
+            # layerwise offload on GPUs smaller than the model),
+            # load weights to CPU instead of GPU.  The layerwise
+            # offload hooks will stream blocks to GPU on demand.
+            if cpu_offload:
+                full_tensor = full_tensor.to(device="cpu",
+                                             dtype=param_dtype)
+            else:
+                full_tensor = full_tensor.to(device=device,
+                                             dtype=param_dtype)
             target_param = named_parameters.get(target_param_name)
             weight_loader = getattr(target_param, "weight_loader", None)
             # Gated on a shape mismatch: only fused/stacked params with a custom
@@ -404,26 +413,25 @@ def load_model_from_full_model_state_dict(
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
     unused_keys = set(meta_sd.keys()) - set(sharded_sd.keys())
-    if unused_keys:
-        logger.warning("Found unloaded parameters in meta state dict: %s",
-                       unused_keys)
 
-    # List of allowed parameter name patterns
-    ALLOWED_NEW_PARAM_PATTERNS = ["gate_compress", "proj_l"]  # Can be extended as needed
+    # Zero-initialize parameters that exist in the model but not in the
+    # checkpoint.  Common reasons: (1) the parameter is loaded by a
+    # different component (e.g. caption_projection loaded by text_encoder),
+    # (2) the parameter is intentionally zero-initialized (e.g. gated
+    # attention logits), or (3) the parameter belongs to a
+    # backend-specific module (e.g. gate_compress for VSA).
+    if unused_keys:
+        logger.warning(
+            "Zero-initializing %d parameters not found in checkpoint: %s",
+            len(unused_keys), unused_keys,
+        )
     for new_param_name in unused_keys:
-        if not any(pattern in new_param_name
-                   for pattern in ALLOWED_NEW_PARAM_PATTERNS):
-            logger.error("Unsupported new parameter: %s. Allowed patterns: %s",
-                         new_param_name, ALLOWED_NEW_PARAM_PATTERNS)
-            raise ValueError(
-                f"New parameter '{new_param_name}' is not supported. "
-                f"Currently only parameters containing {ALLOWED_NEW_PARAM_PATTERNS} are allowed."
-            )
         meta_sharded_param = meta_sd.get(new_param_name)
         if not hasattr(meta_sharded_param, "device_mesh"):
-            # Initialize with zeros
+            # Initialize with zeros (on CPU if offloading)
+            target_dev = "cpu" if cpu_offload else device
             sharded_tensor = torch.zeros_like(meta_sharded_param,
-                                              device=device,
+                                              device=target_dev,
                                               dtype=param_dtype)
         else:
             # Initialize with zeros and distribute
