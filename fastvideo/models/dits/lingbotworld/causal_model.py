@@ -23,6 +23,11 @@ import torch.nn as nn
 from fastvideo.attention import LocalAttention
 from fastvideo.configs.models.dits.lingbotworld import (
     CausalLingBotWorldVideoConfig)
+from fastvideo.distributed.communication_op import (
+    sequence_model_parallel_all_gather_with_unpad,
+    sequence_model_parallel_all_to_all_4D,
+    sequence_model_parallel_shard)
+from fastvideo.distributed.parallel_state import get_sp_world_size
 from fastvideo.layers.layernorm import (FP32LayerNorm, LayerNormScaleShift,
                                         RMSNorm, ScaleResidual,
                                         ScaleResidualLayerNormScaleShift)
@@ -90,6 +95,21 @@ class CausalLingBotSelfAttention(nn.Module):
         frame_seqlen: int = 1560,
         max_attention_size: int | None = None,
     ) -> torch.Tensor:
+        # Ulysses sequence parallelism: incoming q/k/v are
+        # [B, L_local, H, d] (sequence-sharded, all heads).  All-to-all
+        # swaps to [B, L_full, H/P, d] so each rank attends over the
+        # full sequence for its head slice; the KV cache is then
+        # rank-local ([B, kv_size, H/P, d]) with no cross-rank
+        # coordination (matching official image2video_fast.py).
+        sp_size = get_sp_world_size()
+        if sp_size > 1:
+            q = sequence_model_parallel_all_to_all_4D(
+                q, scatter_dim=2, gather_dim=1)
+            k = sequence_model_parallel_all_to_all_4D(
+                k, scatter_dim=2, gather_dim=1)
+            v = sequence_model_parallel_all_to_all_4D(
+                v, scatter_dim=2, gather_dim=1)
+
         cos, sin = freqs_cis
         roped_query = _apply_rotary_emb(q, cos, sin,
                                         is_neox_style=False).type_as(v)
@@ -155,6 +175,11 @@ class CausalLingBotSelfAttention(nn.Module):
 
         kv_cache["global_end_index"].fill_(current_end)
         kv_cache["local_end_index"].fill_(local_end_index)
+
+        if sp_size > 1:
+            # [B, L_full, H/P, d] -> [B, L_local, H, d]
+            x = sequence_model_parallel_all_to_all_4D(
+                x, scatter_dim=1, gather_dim=2)
 
         return x
 
@@ -496,6 +521,21 @@ class CausalLingBotWorldTransformer3DModel(BaseDiT):
                                     dtype=orig_dtype))
             c2ws_hidden = c2ws_hidden + self.c2ws_mlp(c2ws_hidden)
 
+        # Ulysses SP: shard the chunk tokens across ranks.  Attention
+        # all-to-alls to head-sharding internally; everything else
+        # (norms, FFN, cross-attn) is pointwise over tokens.
+        sp_size = get_sp_world_size()
+        original_seq_len = hidden_states.shape[1]
+        if sp_size > 1:
+            assert hidden_states.shape[1] % sp_size == 0, (
+                f"Chunk token count {hidden_states.shape[1]} must be "
+                f"divisible by sp_size {sp_size}")
+            hidden_states, original_seq_len = sequence_model_parallel_shard(
+                hidden_states, dim=1)
+            if c2ws_hidden is not None:
+                c2ws_hidden, _ = sequence_model_parallel_shard(
+                    c2ws_hidden, dim=1)
+
         # Text embedding (pad to text_len)
         encoder_hidden_states = torch.cat([
             encoder_hidden_states,
@@ -537,6 +577,12 @@ class CausalLingBotWorldTransformer3DModel(BaseDiT):
         shift, scale = (self.scale_shift_table.unsqueeze(1) + temb).chunk(
             2, dim=2)
         hidden_states = self.norm_out(hidden_states, shift, scale)
+
+        # Ulysses SP: gather sequence shards back to the full chunk
+        if sp_size > 1:
+            hidden_states = sequence_model_parallel_all_gather_with_unpad(
+                hidden_states, original_seq_len, dim=1)
+
         hidden_states = self.proj_out(hidden_states)
 
         output = self.unpatchify(hidden_states, grid_sizes)

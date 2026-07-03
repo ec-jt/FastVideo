@@ -342,9 +342,15 @@ def load_model_from_full_model_state_dict(
     meta_sd = model.state_dict()
     named_parameters = dict(model.named_parameters())
     sharded_sd = {}
-    custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
-        full_sd_iterator, param_names_mapping)  # type: ignore
-    for target_param_name, full_tensor in custom_param_sd.items():
+    # Stream weights one tensor at a time instead of materializing the
+    # full 2x model-size state dict in host RAM (critical when several
+    # worker processes load concurrently, e.g. sp_size=8).
+    from fastvideo.models.loader.utils import hf_to_custom_state_dict_iter
+    reverse_param_names_mapping: dict = {}
+    custom_param_iter = hf_to_custom_state_dict_iter(
+        full_sd_iterator, param_names_mapping,
+        reverse_param_names_mapping)  # type: ignore
+    for target_param_name, full_tensor in custom_param_iter:
         meta_sharded_param = meta_sd.get(target_param_name)
         if meta_sharded_param is None:
             # Some checkpoints include extra entries that are not part of the

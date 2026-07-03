@@ -95,3 +95,41 @@ def hf_to_custom_state_dict(
                 continue
         custom_param_sd[target_param_name] = full_tensor
     return custom_param_sd, reverse_param_names_mapping
+
+
+def hf_to_custom_state_dict_iter(
+    hf_param_sd: dict[str, torch.Tensor] | Iterator[tuple[str, torch.Tensor]],
+    param_names_mapping: Callable[[str], tuple[str, Any, Any]],
+    reverse_param_names_mapping: dict[str, tuple[str, Any, Any]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Streaming variant of :func:`hf_to_custom_state_dict`.
+
+    Yields ``(target_param_name, tensor)`` pairs one at a time instead
+    of materializing the full state dict, so multi-worker loads do not
+    each hold the entire model in host RAM.  Parameters that require
+    merging (merge_index set) are accumulated until complete, then
+    yielded; everything else streams straight through.
+
+    ``reverse_param_names_mapping`` is filled in-place as a side
+    effect (caller attaches it to the model afterwards).
+    """
+    to_merge_params = defaultdict(dict)  # type: ignore
+    if isinstance(hf_param_sd, dict):
+        hf_param_sd = hf_param_sd.items()  # type: ignore
+    for source_param_name, full_tensor in hf_param_sd:  # type: ignore
+        target_param_name, merge_index, num_params_to_merge = \
+            param_names_mapping(source_param_name)
+        reverse_param_names_mapping[target_param_name] = (
+            source_param_name, merge_index, num_params_to_merge)
+        if merge_index is not None:
+            to_merge_params[target_param_name][merge_index] = full_tensor
+            if len(to_merge_params[target_param_name]) == num_params_to_merge:
+                sorted_tensors = [
+                    to_merge_params[target_param_name][i]
+                    for i in range(num_params_to_merge)
+                ]
+                full_tensor = torch.cat(sorted_tensors, dim=0)
+                del to_merge_params[target_param_name]
+            else:
+                continue
+        yield target_param_name, full_tensor

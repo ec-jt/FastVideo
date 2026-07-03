@@ -19,6 +19,7 @@ Key properties (from FastVideo/LingBot-World-Fast-Diffusers):
 import torch
 
 from fastvideo.distributed import get_local_torch_device
+from fastvideo.distributed.parallel_state import get_sp_world_size
 from fastvideo.fastvideo_args import FastVideoArgs
 from fastvideo.forward_context import set_forward_context
 from fastvideo.logger import init_logger
@@ -311,8 +312,14 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
         Used when local_attn_size == -1 (global attention over all
         previously generated frames), matching the official
         image2video_fast.py: kv_size = frame_seqlen * lat_f.
+
+        Under Ulysses SP the cache is head-sharded: each rank stores
+        num_heads // sp_size heads for the full sequence (official:
+        self_kv_shape = [B, kv_size, local_num_heads, head_dim]).
         """
-        num_attention_heads = self.transformer.num_attention_heads
+        sp_size = get_sp_world_size()
+        num_attention_heads = (self.transformer.num_attention_heads //
+                               sp_size)
         attention_head_dim = self.transformer.attention_head_dim
         if self.local_attn_size != -1:
             kv_cache_size = self.local_attn_size * self.frame_seq_length
