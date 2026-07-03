@@ -41,4 +41,32 @@ LINGBOTWORLD_I2V = InferencePreset(
     },
 )
 
-ALL_PRESETS = (LINGBOTWORLD_I2V, )
+_FAST_DENOISE_STAGE = PresetStageSpec(
+    name="denoise",
+    kind="denoising",
+    description="Causal DMD chunked denoising pass",
+    allowed_overrides=frozenset({
+        "num_inference_steps",
+        "guidance_scale",
+    }),
+)
+
+LINGBOTWORLD_FAST_I2V = InferencePreset(
+    name="lingbotworld_fast_i2v",
+    version=1,
+    model_family="lingbotworld",
+    description="LingBot-World Fast causal DMD I2V (4-step distilled)",
+    workload_type="i2v",
+    stage_schemas=(_FAST_DENOISE_STAGE, ),
+    defaults={
+        "guidance_scale": 1.0,
+        "num_inference_steps": 4,
+        "fps": 16,
+        "num_frames": 161,
+        "height": 480,
+        "width": 832,
+        "negative_prompt": "",
+    },
+)
+
+ALL_PRESETS = (LINGBOTWORLD_I2V, LINGBOTWORLD_FAST_I2V)

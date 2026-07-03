@@ -27,7 +27,10 @@ from fastvideo.configs.pipelines.hunyuan15 import (Hunyuan15T2V480PConfig, Hunyu
                                                    Hunyuan15T2V720PConfig, Hunyuan15I2V720PConfig,
                                                    Hunyuan15SR1080PConfig)
 from fastvideo.configs.pipelines.hyworld import HYWorldConfig
-from fastvideo.configs.pipelines.lingbotworld import LingBotWorldI2V480PConfig
+from fastvideo.configs.pipelines.lingbotworld import (
+    LingBotWorldFastI2VConfig,
+    LingBotWorldI2V480PConfig,
+)
 from fastvideo.configs.pipelines.longcat import LongCatT2V480PConfig
 from fastvideo.pipelines.basic.ltx2.pipeline_configs import LTX2T2VConfig
 from fastvideo.configs.pipelines.flux_2 import (
@@ -477,7 +480,23 @@ def _register_configs() -> None:
         model_family="gamecraft",
         default_preset="gamecraft_i2v",
     )
-    # LingBotWorld
+    # LingBotWorld Fast (causal DMD) — registered BEFORE the base
+    # config so the more-specific detector wins when both fire.
+    register_configs(
+        sampling_param_cls=None,
+        pipeline_config_cls=LingBotWorldFastI2VConfig,
+        workload_types=(WorkloadType.I2V, ),
+        hf_model_paths=[
+            "FastVideo/LingBot-World-Fast-Diffusers",
+        ],
+        model_detectors=[
+            lambda path: (("lingbotworld" in path.lower() or "lingbot-world" in path.lower()) and
+                          ("fast" in path.lower() or "causal" in path.lower())),
+        ],
+        model_family="lingbotworld",
+        default_preset="lingbotworld_fast_i2v",
+    )
+    # LingBotWorld (base cam)
     register_configs(
         sampling_param_cls=None,
         pipeline_config_cls=LingBotWorldI2V480PConfig,
@@ -485,7 +504,10 @@ def _register_configs() -> None:
         hf_model_paths=[
             "FastVideo/LingBot-World-Base-Cam-Diffusers",
         ],
-        model_detectors=[lambda path: ("lingbotworld" in path.lower() or "lingbot-world" in path.lower())],
+        model_detectors=[
+            lambda path: (("lingbotworld" in path.lower() or "lingbot-world" in path.lower()) and "fast" not in path.
+                          lower() and "causal" not in path.lower())
+        ],
         model_family="lingbotworld",
         default_preset="lingbotworld_i2v",
     )

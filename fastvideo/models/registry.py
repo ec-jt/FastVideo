@@ -40,6 +40,7 @@ _TEXT_TO_VIDEO_DIT_MODELS = {
     "LTX2Transformer3DModel": ("dits", "ltx2", "LTX2Transformer3DModel"),
     "SD3Transformer2DModel": ("dits", "sd3", "SD3Transformer2DModel"),
     "LingBotWorldTransformer3DModel": ("dits", "lingbotworld", "LingBotWorldTransformer3DModel"),
+    "CausalLingBotWorldTransformer3DModel": ("dits", "lingbotworld", "CausalLingBotWorldTransformer3DModel"),
     "Gen3CTransformer3DModel": ("dits", "gen3c", "Gen3CTransformer3DModel"),
     "Kandinsky5Transformer3DModel": ("dits", "kandinsky5", "Kandinsky5Transformer3DModel"),
     "Flux2Transformer2DModel": ("dits", "flux_2", "Flux2Transformer2DModel"),
@@ -49,6 +50,7 @@ _IMAGE_TO_VIDEO_DIT_MODELS = {
     # "HunyuanVideoTransformer3DModel": ("dits", "hunyuanvideo", "HunyuanVideoDiT"),
     "WanTransformer3DModel": ("dits", "wanvideo", "WanTransformer3DModel"),
     "CausalWanTransformer3DModel": ("dits", "causal_wanvideo", "CausalWanTransformer3DModel"),
+    "CausalLingBotWorldTransformer3DModel": ("dits", "lingbotworld", "CausalLingBotWorldTransformer3DModel"),
     "MatrixGame2WanModel": ("dits", "matrixgame2", "MatrixGame2WanModel"),
     "CausalMatrixGame2WanModel": ("dits", "matrixgame2", "CausalMatrixGame2WanModel"),
     # Legacy aliases for older HF model_index.json files

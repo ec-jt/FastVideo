@@ -94,3 +94,34 @@ class LingBotWorldVideoConfig(DiTConfig):
     arch_config: DiTArchConfig = field(default_factory=LingBotWorldArchConfig)
 
     prefix: str = "Wan"
+
+
+@dataclass
+class CausalLingBotWorldArchConfig(LingBotWorldArchConfig):
+    """Arch config for the causal (Fast / DMD-distilled) LingBot-World model.
+
+    Matches FastVideo/LingBot-World-Fast-Diffusers transformer/config.json:
+      in_channels=36 (16 noise + 4 mask + 16 VAE-conditioning channels),
+      sink_size=9, num_frames_per_block=3, sliding_window_num_frames=18,
+      local_attn_size=-1 (global attention over the KV cache).
+    """
+
+    in_channels: int = 36
+    out_channels: int = 16
+
+    # Causal KV-cache runtime settings
+    local_attn_size: int = -1
+    sink_size: int = 9
+    num_frames_per_block: int = 3
+    sliding_window_num_frames: int = 18
+
+    # RoPE policy (absolute frame indexing, like Causal Wan)
+    rope_cache_policy: str = "absolute"
+
+
+@dataclass
+class CausalLingBotWorldVideoConfig(DiTConfig):
+    arch_config: DiTArchConfig = field(
+        default_factory=CausalLingBotWorldArchConfig)
+
+    prefix: str = "Wan"
