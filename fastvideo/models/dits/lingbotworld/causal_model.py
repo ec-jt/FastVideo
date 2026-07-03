@@ -125,6 +125,28 @@ class CausalLingBotSelfAttention(nn.Module):
         roped_key = _apply_rotary_emb(k, cos, sin,
                                       is_neox_style=False).type_as(v)
 
+        # Optional fp8 KV cache: cache tensors are float8_e4m3fn with
+        # per-layer scalar scales calibrated on the first write (K is
+        # RoPE'd - rotation preserves norm - and V is a projection
+        # output, so ranges are stable across a session). Attention
+        # reads the fp8 cache directly via flashinfer with
+        # k_scale/v_scale folded into softmax.
+        fp8_kv = kv_cache["k"].dtype == torch.float8_e4m3fn
+        if fp8_kv:
+            if float(kv_cache["k_scale"].item()) == 0.0:
+                kv_cache["k_scale"].fill_(
+                    (roped_key.abs().amax().float() / 448.0).clamp(min=1e-6))
+                kv_cache["v_scale"].fill_(
+                    (v.abs().amax().float() / 448.0).clamp(min=1e-6))
+            k_write = (roped_key.float() /
+                       kv_cache["k_scale"]).clamp(-448, 448).to(
+                           torch.float8_e4m3fn)
+            v_write = (v.float() / kv_cache["v_scale"]).clamp(-448, 448).to(
+                torch.float8_e4m3fn)
+        else:
+            k_write = roped_key
+            v_write = v
+
         current_end = current_start + q.shape[1]
         sink_tokens = self.sink_size * frame_seqlen
         num_new_tokens = q.shape[1]
@@ -144,8 +166,8 @@ class CausalLingBotSelfAttention(nn.Module):
             local_end_index = (local_end_index_prev + current_end -
                                global_end_index)
             local_start_index = local_end_index - num_new_tokens
-            kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-            kv_cache["v"][:, local_start_index:local_end_index] = v
+            kv_cache["k"][:, local_start_index:local_end_index] = k_write
+            kv_cache["v"][:, local_start_index:local_end_index] = v_write
         elif (current_end > global_end_index) and (
                 num_new_tokens + local_end_index_prev > kv_cache_size):
             # Roll the cache, keeping sink tokens pinned.
@@ -164,14 +186,14 @@ class CausalLingBotSelfAttention(nn.Module):
             local_end_index = (local_end_index_prev + current_end -
                                global_end_index - num_evicted_tokens)
             local_start_index = local_end_index - num_new_tokens
-            kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-            kv_cache["v"][:, local_start_index:local_end_index] = v
+            kv_cache["k"][:, local_start_index:local_end_index] = k_write
+            kv_cache["v"][:, local_start_index:local_end_index] = v_write
         else:
             local_end_index = (local_end_index_prev + current_end -
                                global_end_index)
             local_start_index = local_end_index - num_new_tokens
-            kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-            kv_cache["v"][:, local_start_index:local_end_index] = v
+            kv_cache["k"][:, local_start_index:local_end_index] = k_write
+            kv_cache["v"][:, local_start_index:local_end_index] = v_write
 
         key_window = kv_cache["k"][:,
                                    max(0, local_end_index -
@@ -180,7 +202,11 @@ class CausalLingBotSelfAttention(nn.Module):
                                      max(0, local_end_index -
                                          max_attention_size):local_end_index]
 
-        x = self.attn(roped_query, key_window, value_window)
+        if fp8_kv:
+            x = self._fp8_attention(roped_query, key_window, value_window,
+                                    kv_cache)
+        else:
+            x = self.attn(roped_query, key_window, value_window)
 
         kv_cache["global_end_index"].fill_(current_end)
         kv_cache["local_end_index"].fill_(local_end_index)
@@ -191,6 +217,31 @@ class CausalLingBotSelfAttention(nn.Module):
                 x, scatter_dim=1, gather_dim=2)
 
         return x
+
+    @torch.compiler.disable
+    def _fp8_attention(self, q: torch.Tensor, k_fp8: torch.Tensor,
+                       v_fp8: torch.Tensor,
+                       kv_cache: dict) -> torch.Tensor:
+        """Attention over the fp8 KV cache window via flashinfer.
+
+        q: [B, L, H, d] bf16; k_fp8/v_fp8: [B, kv_len, H, d]
+        float8_e4m3fn. flashinfer's single_prefill reads fp8 K/V
+        directly with k_scale/v_scale folded into the softmax
+        (halves cache read bandwidth vs bf16).
+        """
+        from flashinfer import single_prefill_with_kv_cache
+        assert q.shape[0] == 1, "fp8 KV attention path assumes batch=1"
+        out = single_prefill_with_kv_cache(
+            q.squeeze(0),
+            k_fp8.squeeze(0),
+            v_fp8.squeeze(0),
+            causal=False,
+            kv_layout="NHD",
+            o_dtype=q.dtype,
+            k_scale=float(kv_cache["k_scale"].item()),
+            v_scale=float(kv_cache["v_scale"].item()),
+        )
+        return out.unsqueeze(0)
 
 
 class CausalLingBotWorldTransformerBlock(nn.Module):

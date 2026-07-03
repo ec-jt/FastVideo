@@ -319,6 +319,11 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
         Under Ulysses SP the cache is head-sharded: each rank stores
         num_heads // sp_size heads for the full sequence (official:
         self_kv_shape = [B, kv_size, local_num_heads, head_dim]).
+
+        With FP8_KV_CACHE=true the cache is float8_e4m3fn (half the
+        memory and read bandwidth) with per-layer scalar k/v scales
+        calibrated on first write; attention reads it via flashinfer
+        with scales folded into softmax.
         """
         sp_size = get_sp_world_size()
         num_attention_heads = (self.transformer.num_attention_heads //
@@ -329,28 +334,44 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
         else:
             kv_cache_size = self.frame_seq_length * num_latent_frames
 
+        fp8_kv = os.environ.get("FP8_KV_CACHE",
+                                "false").lower() == "true"
+        kv_dtype = torch.float8_e4m3fn if fp8_kv else dtype
+        if fp8_kv:
+            logger.info("[LingBot-Fast] Using fp8 (e4m3) KV cache")
+
         cache = []
         for _ in range(self.num_transformer_blocks):
-            cache.append({
+            entry = {
                 "k":
                 torch.zeros([
                     batch_size, kv_cache_size, num_attention_heads,
                     attention_head_dim
                 ],
-                            dtype=dtype,
+                            dtype=kv_dtype,
                             device=device),
                 "v":
                 torch.zeros([
                     batch_size, kv_cache_size, num_attention_heads,
                     attention_head_dim
                 ],
-                            dtype=dtype,
+                            dtype=kv_dtype,
                             device=device),
                 "global_end_index":
                 torch.tensor([0], dtype=torch.long, device=device),
                 "local_end_index":
                 torch.tensor([0], dtype=torch.long, device=device),
-            })
+            }
+            if fp8_kv:
+                # 0.0 means "not yet calibrated"; the attention layer
+                # fills these on the first write.
+                entry["k_scale"] = torch.zeros([],
+                                               dtype=torch.float32,
+                                               device=device)
+                entry["v_scale"] = torch.zeros([],
+                                               dtype=torch.float32,
+                                               device=device)
+            cache.append(entry)
         return cache
 
 
