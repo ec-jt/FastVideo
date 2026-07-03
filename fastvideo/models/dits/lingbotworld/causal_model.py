@@ -195,15 +195,24 @@ class CausalLingBotWorldTransformerBlock(nn.Module):
                  qk_norm: str = "rms_norm_across_heads",
                  cross_attn_norm: bool = True,
                  eps: float = 1e-6,
+                 quant_config=None,
                  prefix: str = ""):
         super().__init__()
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ReplicatedLinear(dim, dim, bias=True)
-        self.to_k = ReplicatedLinear(dim, dim, bias=True)
-        self.to_v = ReplicatedLinear(dim, dim, bias=True)
-        self.to_out = ReplicatedLinear(dim, dim, bias=True)
+        self.to_q = ReplicatedLinear(dim, dim, bias=True,
+                                     quant_config=quant_config,
+                                     prefix=f"{prefix}.to_q")
+        self.to_k = ReplicatedLinear(dim, dim, bias=True,
+                                     quant_config=quant_config,
+                                     prefix=f"{prefix}.to_k")
+        self.to_v = ReplicatedLinear(dim, dim, bias=True,
+                                     quant_config=quant_config,
+                                     prefix=f"{prefix}.to_v")
+        self.to_out = ReplicatedLinear(dim, dim, bias=True,
+                                       quant_config=quant_config,
+                                       prefix=f"{prefix}.to_out")
         self.attn1 = CausalLingBotSelfAttention(
             dim,
             num_heads,
@@ -237,7 +246,9 @@ class CausalLingBotWorldTransformerBlock(nn.Module):
         self.attn2 = WanT2VCrossAttention(dim,
                                           num_heads,
                                           qk_norm=qk_norm,
-                                          eps=eps)
+                                          eps=eps,
+                                          quant_config=quant_config,
+                                          prefix=f"{prefix}.attn2")
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
             norm_type="layer",
@@ -247,7 +258,9 @@ class CausalLingBotWorldTransformerBlock(nn.Module):
             compute_dtype=torch.float32)
 
         # 3. Feed-forward
-        self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
+        self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh",
+                       quant_config=quant_config,
+                       prefix=f"{prefix}.ffn")
         self.mlp_residual = ScaleResidual()
 
         self.scale_shift_table = nn.Parameter(
@@ -404,6 +417,7 @@ class CausalLingBotWorldTransformer3DModel(BaseDiT):
         )
 
         # 3. Transformer blocks
+        quant_config = getattr(config, "quant_config", None)
         self.blocks = nn.ModuleList([
             CausalLingBotWorldTransformerBlock(
                 inner_dim,
@@ -414,6 +428,7 @@ class CausalLingBotWorldTransformer3DModel(BaseDiT):
                 config.qk_norm,
                 config.cross_attn_norm,
                 config.eps,
+                quant_config=quant_config,
                 prefix=f"{config.prefix}.blocks.{i}")
             for i in range(config.num_layers)
         ])

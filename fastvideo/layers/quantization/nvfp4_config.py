@@ -263,13 +263,18 @@ def _mm_fp4(
 
 class NVFP4QuantizeMethod(QuantizeMethodBase):
 
-    def __init__(self, layer_prefix: str = ""):
+    def __init__(self, layer_prefix: str = "", free_dense_weight: bool = False):
         super().__init__()
         self.weight_fp4 = None
         self.weight_scale = None
         self.x_global_sf = torch.tensor(1.0, device="cuda", dtype=torch.float32)
         self.layer_prefix = layer_prefix
         self._is_refine_only_layer = _is_ltx2_refine_only_prefix(layer_prefix)
+        # When True, ``convert_model_to_nvfp4`` drops the dense bf16
+        # ``weight`` Parameter after registering the fp4 buffers so very
+        # large models (e.g. LingBot-World 28B) fit resident on a single
+        # GPU. Layers with this flag never fall back to the dense path.
+        self.free_dense_weight = free_dense_weight
 
     def create_weights(self, layer: torch.nn.Module, input_size_per_partition: int, output_partition_sizes: list[int],
                        input_size: int, output_size: int, params_dtype: torch.dtype, **extra_weight_attrs):
@@ -311,16 +316,20 @@ class NVFP4QuantizeMethod(QuantizeMethodBase):
         | None = None,
     ) -> torch.Tensor:
         SfLayout, _, _ = _require_flashinfer()
-        out_dim = layer.weight.shape[0]
+        dense_weight = getattr(layer, "weight", None)
+        out_dim = (dense_weight.shape[0] if dense_weight is not None else
+                   layer._nvfp4_weight.shape[0])
         original_shape = x.shape
 
         # Stage-aware profile: keep refine-only FP4 layers in dense mode
         # during stage-1 denoising so the base path doesn't pay the
-        # quantize/dequantize tax for layers it never touches.
-        stage_profile = _get_ltx2_fp4_stage_profile(default="refine")
-        if self._is_refine_only_layer and stage_profile == "base":
-            out = (F.linear(x, layer.weight, bias) if torch.cuda.is_available() or bias is None else F.linear(
-                x, layer.weight, bias.to(x.dtype)))
+        # quantize/dequantize tax for layers it never touches. Only
+        # consulted for refine-only layers; free-dense layers have no
+        # dense weight to fall back to.
+        if (self._is_refine_only_layer and dense_weight is not None
+                and _get_ltx2_fp4_stage_profile(default="refine") == "base"):
+            out = (F.linear(x, dense_weight, bias) if torch.cuda.is_available() or bias is None else F.linear(
+                x, dense_weight, bias.to(x.dtype)))
             return out.view(*original_shape[:-1], out_dim)
         if pre_quantized is not None:
             x_fp4, x_scale, x_global_sf = pre_quantized
@@ -434,6 +443,8 @@ def convert_model_to_nvfp4(model: torch.nn.Module) -> None:
     SfLayout, _, _ = _require_flashinfer()
     from torch.distributed.tensor import DTensor  # type: ignore
 
+    target_device: torch.device | None = None
+    freed_any = False
     for mod in model.modules():
         qm = getattr(mod, "quant_method", None)
         if isinstance(qm, NVFP4QuantizeMethod):
@@ -441,6 +452,15 @@ def convert_model_to_nvfp4(model: torch.nn.Module) -> None:
             if weight is None:
                 continue
             weight_local = weight.to_local() if isinstance(weight, DTensor) else weight  # type: ignore[arg-type]
+            free_dense = getattr(qm, "free_dense_weight", False)
+            if free_dense and not weight_local.is_cuda:
+                # Streaming conversion: weights were loaded to CPU (the
+                # dense model may not fit on GPU); move one layer at a
+                # time to GPU, quantize, and drop the bf16 copy.
+                if target_device is None:
+                    from fastvideo.distributed import get_local_torch_device
+                    target_device = get_local_torch_device()
+                weight_local = weight_local.to(target_device)
             weight_global_sf = (448 * 6) / weight_local.float().abs().nan_to_num().max()
             fp4_w, fp4_s = _nvfp4_quantize(
                 weight_local,
@@ -465,10 +485,75 @@ def convert_model_to_nvfp4(model: torch.nn.Module) -> None:
                 (1.0 / weight_global_sf_t).to(dtype=torch.float32),
                 persistent=False,
             )
+            if free_dense:
+                del mod._parameters["weight"]
+                del weight, weight_local
+                freed_any = True
+
+    if freed_any:
+        # Move the remaining dense params/buffers (norms, embeddings,
+        # biases, cam conditioner, proj_out) to the GPU so the whole
+        # model is resident. Quantized weights are already there and
+        # their dense Parameters no longer exist.
+        if target_device is None:
+            from fastvideo.distributed import get_local_torch_device
+            target_device = get_local_torch_device()
+        model.to(target_device)
+        torch.cuda.empty_cache()
+
+
+_LINGBOT_FP4_SUFFIXES = (
+    ".to_q",
+    ".to_k",
+    ".to_v",
+    ".to_out",
+    ".ffn.fc_in",
+    ".ffn.fc_out",
+)
+
+
+class LingBotWorldNVFP4Config(QuantizationConfig):
+    """NVFP4 quantization for LingBot-World causal transformer blocks.
+
+    Tags every attention projection (self and cross) and FFN linear in
+    ``*.blocks.*`` with :class:`NVFP4QuantizeMethod` in free-dense mode:
+    weights are quantized at load time (streamed layer by layer to the
+    GPU) and the bf16 copies are dropped, so the 28B DiT fits resident
+    on a 32GB GPU (~8GB fp4 + scales for the quantized set).
+    """
+
+    def get_name(self):
+        return "nvfp4_lingbot"
+
+    def get_supported_act_dtypes(self):
+        return [torch.bfloat16, torch.float16]
+
+    @classmethod
+    def get_min_capability(cls):
+        return 100
+
+    @staticmethod
+    def get_config_filenames():
+        return []
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> "LingBotWorldNVFP4Config":
+        del config
+        return cls()
+
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        from fastvideo.layers.linear import LinearBase
+
+        if (isinstance(layer, LinearBase) and ".blocks." in prefix
+                and prefix.endswith(_LINGBOT_FP4_SUFFIXES)):
+            return NVFP4QuantizeMethod(layer_prefix=prefix,
+                                       free_dense_weight=True)
+        return None
 
 
 __all__ = [
     "NVFP4Config",
+    "LingBotWorldNVFP4Config",
     "NVFP4QuantizeMethod",
     "convert_model_to_nvfp4",
 ]
