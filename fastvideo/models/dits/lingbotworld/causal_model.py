@@ -101,14 +101,23 @@ class CausalLingBotSelfAttention(nn.Module):
         # full sequence for its head slice; the KV cache is then
         # rank-local ([B, kv_size, H/P, d]) with no cross-rank
         # coordination (matching official image2video_fast.py).
+        #
+        # Comm fusion: q/k/v are concatenated along head_dim (the last
+        # dim) so ONE all-to-all moves all three. Scattering happens on
+        # the head dim (dim 2), so the per-head [q|k|v] feature concat
+        # is preserved on every rank; a single split recovers the
+        # tensors. 1 NCCL launch instead of 3 with a 3x larger message
+        # utilizes the PIX link far better at small chunk sizes.
         sp_size = get_sp_world_size()
         if sp_size > 1:
-            q = sequence_model_parallel_all_to_all_4D(
-                q, scatter_dim=2, gather_dim=1)
-            k = sequence_model_parallel_all_to_all_4D(
-                k, scatter_dim=2, gather_dim=1)
-            v = sequence_model_parallel_all_to_all_4D(
-                v, scatter_dim=2, gather_dim=1)
+            head_dim = q.shape[-1]
+            qkv = torch.cat([q, k, v], dim=-1)
+            qkv = sequence_model_parallel_all_to_all_4D(
+                qkv, scatter_dim=2, gather_dim=1)
+            q, k, v = qkv.split(head_dim, dim=-1)
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
 
         cos, sin = freqs_cis
         roped_query = _apply_rotary_emb(q, cos, sin,
