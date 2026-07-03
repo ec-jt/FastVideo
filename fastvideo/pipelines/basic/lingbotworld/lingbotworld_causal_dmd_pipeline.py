@@ -176,10 +176,17 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
         y = self._encode_conditioning(batch, fastvideo_args, t, h, w,
                                       target_dtype)
 
-        # KV caches
-        kv_cache = self._initialize_kv_cache(batch_size=b,
-                                             dtype=target_dtype,
-                                             device=latents.device)
+        # KV caches.
+        # Official image2video_fast.py: with local_attn_size == -1 the
+        # cache covers the FULL video (frame_seqlen * lat_f), not the
+        # sliding window.  The base class sizes by
+        # sliding_window_num_frames, which overflows for videos longer
+        # than the window, so size it explicitly here.
+        kv_cache = self._initialize_full_kv_cache(
+            batch_size=b,
+            num_latent_frames=t,
+            dtype=target_dtype,
+            device=latents.device)
         crossattn_cache = self._initialize_crossattn_cache(
             batch_size=b,
             max_text_len=fastvideo_args.pipeline_config.
@@ -295,6 +302,46 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
 
         batch.latents = latents
         return batch
+
+
+    def _initialize_full_kv_cache(self, batch_size, num_latent_frames,
+                                  dtype, device) -> list[dict]:
+        """Allocate a KV cache covering the full video.
+
+        Used when local_attn_size == -1 (global attention over all
+        previously generated frames), matching the official
+        image2video_fast.py: kv_size = frame_seqlen * lat_f.
+        """
+        num_attention_heads = self.transformer.num_attention_heads
+        attention_head_dim = self.transformer.attention_head_dim
+        if self.local_attn_size != -1:
+            kv_cache_size = self.local_attn_size * self.frame_seq_length
+        else:
+            kv_cache_size = self.frame_seq_length * num_latent_frames
+
+        cache = []
+        for _ in range(self.num_transformer_blocks):
+            cache.append({
+                "k":
+                torch.zeros([
+                    batch_size, kv_cache_size, num_attention_heads,
+                    attention_head_dim
+                ],
+                            dtype=dtype,
+                            device=device),
+                "v":
+                torch.zeros([
+                    batch_size, kv_cache_size, num_attention_heads,
+                    attention_head_dim
+                ],
+                            dtype=dtype,
+                            device=device),
+                "global_end_index":
+                torch.tensor([0], dtype=torch.long, device=device),
+                "local_end_index":
+                torch.tensor([0], dtype=torch.long, device=device),
+            })
+        return cache
 
 
 class LingBotWorldCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):

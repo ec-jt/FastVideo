@@ -142,8 +142,16 @@ def enable_layerwise_offload(model: nn.Module, is_replace: bool = False):
         return
     state_list = []
     async_stream = torch.cuda.Stream()
-    for name, submodule in model.named_children():
+    # Search recursively for nn.ModuleList.  Some models nest the
+    # transformer blocks inside a wrapper module, so a shallow
+    # named_children() search misses them.
+    offloaded_module_list = None
+    for name, submodule in model.named_modules():
         if isinstance(submodule, nn.ModuleList):
+            logger.info(
+                "Layerwise offload: found ModuleList '%s' with %d entries",
+                name, len(submodule))
+            offloaded_module_list = submodule
             for idx, module_entry in enumerate(submodule):
                 state = LayerwiseOffloadState(async_copy_stream=async_stream, device=device)
                 state_list.append(state)
@@ -164,3 +172,32 @@ def enable_layerwise_offload(model: nn.Module, is_replace: bool = False):
     # circular linking of states
     for i in range(len(state_list)):
         state_list[i].next_state = state_list[(i + 1) % len(state_list)]
+
+    # Move non-offloaded parameters (embeddings, norms, proj layers,
+    # etc.) to GPU.  These are small relative to the blocks and must
+    # be on GPU for the forward pass.  The ModuleList block params are
+    # already handled by the hooks (pinned CPU with zero-size GPU
+    # placeholders).
+    offloaded_param_ids: set[int] = set()
+    if offloaded_module_list is not None:
+        for p in offloaded_module_list.parameters():
+            offloaded_param_ids.add(id(p))
+
+    moved_params = 0
+    moved_bytes = 0
+    for n, param in model.named_parameters():
+        if id(param) not in offloaded_param_ids:
+            if param.device.type != device.type:
+                param.data = param.data.to(device)
+                moved_params += 1
+                moved_bytes += param.nelement() * param.element_size()
+    for n, buf in model.named_buffers():
+        if buf.device.type != device.type:
+            buf.data = buf.data.to(device)
+            moved_params += 1
+            moved_bytes += buf.nelement() * buf.element_size()
+    if moved_params > 0:
+        logger.info(
+            "Layerwise offload: moved %d non-block params/buffers "
+            "(%.1f MB) to %s",
+            moved_params, moved_bytes / 1e6, device)
