@@ -16,6 +16,9 @@ Key properties (from FastVideo/LingBot-World-Fast-Diffusers):
     replacing the first latent frame.
 """
 
+import os
+import sys
+
 import torch
 
 from fastvideo.distributed import get_local_torch_device
@@ -351,6 +354,68 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
         return cache
 
 
+class TAEHVDecodingStage(DecodingStage):
+    """Decoding stage with optional TAEHV tiny-VAE decode.
+
+    When ``USE_TAEHV_DECODE=true``, decodes latents with madebyollin's
+    TAEHV (taew2_1 weights - LingBot-World uses the Wan 2.1 VAE) which
+    is ~5x faster and needs <0.5GB peak vs the full AutoencoderKLWan
+    decoder. TAEHV operates on the NORMALIZED diffusion latent space
+    directly (no denormalize step). Falls back to the full VAE when
+    the flag is unset or loading fails.
+
+    Env:
+      USE_TAEHV_DECODE: "true" to enable (default false)
+      TAEHV_DIR:        dir containing taehv.py (default /taehv)
+      TAEHV_WEIGHTS:    checkpoint (default $TAEHV_DIR/taew2_1.pth)
+    """
+
+    def __init__(self, vae, pipeline=None) -> None:
+        super().__init__(vae, pipeline)
+        self._taehv = None
+        self._taehv_failed = False
+
+    def _get_taehv(self, device: torch.device):
+        if self._taehv is not None or self._taehv_failed:
+            return self._taehv
+        try:
+            taehv_dir = os.environ.get("TAEHV_DIR", "/taehv")
+            weights = os.environ.get(
+                "TAEHV_WEIGHTS", os.path.join(taehv_dir, "taew2_1.pth"))
+            if taehv_dir not in sys.path:
+                sys.path.insert(0, taehv_dir)
+            from taehv import TAEHV  # type: ignore[import-not-found]
+            model = TAEHV(checkpoint_path=weights)
+            model = model.to(device=device, dtype=torch.float16).eval()
+            self._taehv = model
+            logger.info("TAEHV decoder loaded from %s", weights)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "TAEHV decode requested but failed to load (%s); "
+                "falling back to full VAE decode.", e)
+            self._taehv_failed = True
+        return self._taehv
+
+    @torch.no_grad()
+    def decode(self, latents: torch.Tensor,
+               fastvideo_args: FastVideoArgs) -> torch.Tensor:
+        if os.environ.get("USE_TAEHV_DECODE", "false").lower() != "true":
+            return super().decode(latents, fastvideo_args)
+        taehv = self._get_taehv(latents.device)
+        if taehv is None:
+            return super().decode(latents, fastvideo_args)
+        # TAEHV wants NTCHW latents in the normalized (~Gaussian)
+        # diffusion space; batch.latents is [B, C, T, H, W] and already
+        # normalized (DecodingStage would denormalize for the full VAE,
+        # TAEHV was trained on the normalized space so we skip it).
+        x = latents.to(dtype=torch.float16).permute(0, 2, 1, 3, 4)
+        video = taehv.decode_video(x,
+                                   parallel=True,
+                                   show_progress_bar=False)
+        # NTCHW [0,1] -> [B, C, T, H, W]
+        return video.permute(0, 2, 1, 3, 4).clamp(0, 1)
+
+
 class LingBotWorldCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
     """LingBot-World Fast (causal DMD-distilled) image-to-video pipeline."""
 
@@ -397,7 +462,7 @@ class LingBotWorldCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
                            vae=self.get_module("vae")))
 
         self.add_stage(stage_name="decoding_stage",
-                       stage=DecodingStage(vae=self.get_module("vae")))
+                       stage=TAEHVDecodingStage(vae=self.get_module("vae")))
 
 
 EntryClass = LingBotWorldCausalDMDPipeline
