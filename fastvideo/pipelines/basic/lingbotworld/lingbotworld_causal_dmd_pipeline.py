@@ -375,12 +375,13 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
                 torch.tensor([0], dtype=torch.long, device=device),
             }
             if fp8_kv:
-                # 0.0 means "not yet calibrated"; the attention layer
-                # fills these on the first write.
-                entry["k_scale"] = torch.zeros([],
+                # Per-head scales, [num_local_heads]; 0.0 means "not
+                # yet calibrated" - the attention layer fills these on
+                # the first write.
+                entry["k_scale"] = torch.zeros([num_attention_heads],
                                                dtype=torch.float32,
                                                device=device)
-                entry["v_scale"] = torch.zeros([],
+                entry["v_scale"] = torch.zeros([num_attention_heads],
                                                dtype=torch.float32,
                                                device=device)
             cache.append(entry)

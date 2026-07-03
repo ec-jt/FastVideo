@@ -126,22 +126,34 @@ class CausalLingBotSelfAttention(nn.Module):
                                       is_neox_style=False).type_as(v)
 
         # Optional fp8 KV cache: cache tensors are float8_e4m3fn with
-        # per-layer scalar scales calibrated on the first write (K is
-        # RoPE'd - rotation preserves norm - and V is a projection
-        # output, so ranges are stable across a session). Attention
-        # reads the fp8 cache directly via flashinfer with
-        # k_scale/v_scale folded into softmax.
+        # PER-HEAD scales calibrated on the first write (K is RoPE'd -
+        # rotation preserves norm - and V is a projection output, so
+        # per-head ranges are stable across a session). Per-head scales
+        # cut quantization noise vs per-tensor: attention errors
+        # compound chunk-to-chunk through the t=0 KV refresh, so cache
+        # fidelity directly bounds long-rollout drift.
+        #
+        # flashinfer's fa2 kernel only takes SCALAR k/v scales, so the
+        # per-head factors are folded outside the kernel instead:
+        #   QK^T: q_h' = q_h * k_scale_h  (per-head scale commutes into q)
+        #   PV:   out_h' = out_h * v_scale_h (softmax weights sum to 1,
+        #         so the V scale factors out of the weighted sum)
+        # The kernel then runs with k_scale=v_scale=1.
         fp8_kv = kv_cache["k"].dtype == torch.float8_e4m3fn
         if fp8_kv:
-            if float(kv_cache["k_scale"].item()) == 0.0:
-                kv_cache["k_scale"].fill_(
-                    (roped_key.abs().amax().float() / 448.0).clamp(min=1e-6))
-                kv_cache["v_scale"].fill_(
-                    (v.abs().amax().float() / 448.0).clamp(min=1e-6))
-            k_write = (roped_key.float() /
-                       kv_cache["k_scale"]).clamp(-448, 448).to(
-                           torch.float8_e4m3fn)
-            v_write = (v.float() / kv_cache["v_scale"]).clamp(-448, 448).to(
+            if float(kv_cache["k_scale"].amax().item()) == 0.0:
+                # [H] per-head absmax over (batch, seq, dim)
+                kv_cache["k_scale"].copy_(
+                    (roped_key.float().abs().amax(dim=(0, 1, 3)) /
+                     448.0).clamp(min=1e-6))
+                kv_cache["v_scale"].copy_(
+                    (v.float().abs().amax(dim=(0, 1, 3)) /
+                     448.0).clamp(min=1e-6))
+            k_scale = kv_cache["k_scale"].view(1, 1, -1, 1)
+            v_scale = kv_cache["v_scale"].view(1, 1, -1, 1)
+            k_write = (roped_key.float() / k_scale).clamp(-448, 448).to(
+                torch.float8_e4m3fn)
+            v_write = (v.float() / v_scale).clamp(-448, 448).to(
                 torch.float8_e4m3fn)
         else:
             k_write = roped_key
@@ -225,22 +237,29 @@ class CausalLingBotSelfAttention(nn.Module):
         """Attention over the fp8 KV cache window via flashinfer.
 
         q: [B, L, H, d] bf16; k_fp8/v_fp8: [B, kv_len, H, d]
-        float8_e4m3fn. flashinfer's single_prefill reads fp8 K/V
-        directly with k_scale/v_scale folded into the softmax
-        (halves cache read bandwidth vs bf16).
+        float8_e4m3fn with PER-HEAD scales. flashinfer's fa2 kernel
+        only takes scalar scales, so the per-head factors are folded
+        outside the kernel: k_scale_h into q (commutes through QK^T)
+        and v_scale_h onto the output (softmax weights sum to 1, so
+        the V scale factors out of the PV weighted sum).
         """
         from flashinfer import single_prefill_with_kv_cache
         assert q.shape[0] == 1, "fp8 KV attention path assumes batch=1"
+        head_dim = q.shape[-1]
+        sm_scale = head_dim**-0.5
+        k_scale = kv_cache["k_scale"].view(1, -1, 1)  # [1, H, 1]
+        v_scale = kv_cache["v_scale"].view(1, -1, 1)
+        q_scaled = (q.squeeze(0).float() * k_scale).to(q.dtype)
         out = single_prefill_with_kv_cache(
-            q.squeeze(0),
+            q_scaled,
             k_fp8.squeeze(0),
             v_fp8.squeeze(0),
             causal=False,
             kv_layout="NHD",
             o_dtype=q.dtype,
-            k_scale=float(kv_cache["k_scale"].item()),
-            v_scale=float(kv_cache["v_scale"].item()),
+            sm_scale=sm_scale,
         )
+        out = (out.float() * v_scale).to(q.dtype)
         return out.unsqueeze(0)
 
 
