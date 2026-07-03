@@ -1029,7 +1029,10 @@ class TransformerLoader(ComponentLoader):
             hsdp_replicate_dim=fastvideo_args.hsdp_replicate_dim,
             hsdp_shard_dim=fastvideo_args.hsdp_shard_dim,
             strict=strict_load,
-            cpu_offload=fastvideo_args.dit_cpu_offload,
+            # Layerwise offload requires weights resident on CPU;
+            # the hooks stream blocks to GPU during forward.
+            cpu_offload=(fastvideo_args.dit_cpu_offload
+                         or fastvideo_args.dit_layerwise_offload),
             pin_cpu_memory=fastvideo_args.pin_cpu_memory,
             fsdp_inference=fastvideo_args.use_fsdp_inference,
             # TODO(will): make these configurable
