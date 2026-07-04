@@ -320,6 +320,227 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
         return batch
 
 
+    # ------------------------------------------------------------------
+    # Streaming (Phase 4 interactive sessions): one chunk per step.
+    # Mirrors the executor streaming interface used by MatrixGame2
+    # (execute_streaming_reset/step/clear -> pipeline.streaming_*).
+    # ------------------------------------------------------------------
+
+    _stream: dict | None = None
+
+    @torch.no_grad()
+    def streaming_reset(self, batch: ForwardBatch,
+                        fastvideo_args: FastVideoArgs) -> ForwardBatch:
+        """Initialize a stepwise generation session.
+
+        Runs the same setup as forward() (timesteps, conditioning y,
+        KV caches) but stores the loop state instead of iterating, so
+        each streaming_step() denoises exactly one 3-latent-frame
+        chunk.
+        """
+        target_dtype = torch.bfloat16
+        autocast_enabled = (target_dtype != torch.float32
+                            ) and not fastvideo_args.disable_autocast
+
+        latent_seq_length = (batch.latents.shape[-1] *
+                             batch.latents.shape[-2])
+        patch_size = self.transformer.config.arch_config.patch_size
+        patch_ratio = patch_size[-1] * patch_size[-2]
+        self.frame_seq_length = latent_seq_length // patch_ratio
+
+        timesteps = torch.tensor(
+            fastvideo_args.pipeline_config.dmd_denoising_steps,
+            dtype=torch.long).cpu()
+        if fastvideo_args.pipeline_config.warp_denoising_step:
+            scheduler_timesteps = torch.cat(
+                (self.scheduler.timesteps.cpu(),
+                 torch.tensor([0], dtype=torch.float32)))
+            timesteps = scheduler_timesteps[1000 - timesteps]
+        timesteps = timesteps.to(get_local_torch_device())
+
+        assert batch.latents is not None
+        latents = batch.latents
+        t_full = latents.shape[2]
+        t = t_full - (t_full % self.num_frames_per_block)
+        if t != t_full:
+            latents = latents[:, :, :t]
+            batch.latents = latents
+        b, c, t, h, w = latents.shape
+
+        prompt_embeds = batch.prompt_embeds
+        if not isinstance(prompt_embeds, torch.Tensor):
+            prompt_embeds = prompt_embeds[0]
+
+        y = self._encode_conditioning(batch, fastvideo_args, t, h, w,
+                                      target_dtype)
+
+        kv_cache = self._initialize_full_kv_cache(
+            batch_size=b,
+            num_latent_frames=t,
+            dtype=target_dtype,
+            device=latents.device)
+        crossattn_cache = self._initialize_crossattn_cache(
+            batch_size=b,
+            max_text_len=fastvideo_args.pipeline_config.
+            text_encoder_configs[0].arch_config.text_len,
+            dtype=target_dtype,
+            device=latents.device)
+
+        self._stream = {
+            "batch": batch,
+            "fastvideo_args": fastvideo_args,
+            "latents": latents,
+            "prompt_embeds": prompt_embeds,
+            "y": y,
+            "kv_cache": kv_cache,
+            "crossattn_cache": crossattn_cache,
+            "timesteps": timesteps,
+            "start_index": 0,
+            "block_idx": 0,
+            "num_blocks": t // self.num_frames_per_block,
+            "target_dtype": target_dtype,
+            "autocast_enabled": autocast_enabled,
+            "max_attention_size": kv_cache[0]["k"].shape[1],
+        }
+        logger.info(
+            "[LingBot-Fast] streaming session: %d chunks of %d latent "
+            "frames (%dx%d)", self._stream["num_blocks"],
+            self.num_frames_per_block, h, w)
+        return batch
+
+    @torch.no_grad()
+    def streaming_step(self,
+                       keyboard_action: torch.Tensor | None = None,
+                       mouse_action: torch.Tensor | None = None
+                       ) -> ForwardBatch:
+        """Denoise ONE chunk (4 DMD steps + t=0 cache refresh).
+
+        keyboard_action/mouse_action are accepted for executor
+        interface compatibility; camera conditioning
+        (c2ws_plucker_emb) is the LingBot control channel and will be
+        threaded through in the follow-up.
+        """
+        st = self._stream
+        if st is None:
+            raise RuntimeError(
+                "Streaming not initialized; call streaming_reset first.")
+        batch = st["batch"]
+        if st["block_idx"] >= st["num_blocks"]:
+            return batch
+
+        fastvideo_args = st["fastvideo_args"]
+        latents = st["latents"]
+        y = st["y"]
+        timesteps = st["timesteps"]
+        target_dtype = st["target_dtype"]
+        autocast_enabled = st["autocast_enabled"]
+        start_index = st["start_index"]
+        current_num_frames = self.num_frames_per_block
+        b = latents.shape[0]
+
+        current_latents = latents[:, :, start_index:start_index +
+                                  current_num_frames]
+        current_y = y[:, :, start_index:start_index + current_num_frames]
+
+        noise_latents_btchw = current_latents.permute(0, 2, 1, 3, 4)
+        video_raw_latent_shape = noise_latents_btchw.shape
+
+        for i, t_cur in enumerate(timesteps):
+            noise_latents = noise_latents_btchw.clone()
+            latent_model_input = current_latents.to(target_dtype)
+            t_expand = t_cur.repeat(latent_model_input.shape[0])
+
+            with torch.autocast(device_type="cuda",
+                                dtype=target_dtype,
+                                enabled=autocast_enabled), \
+                set_forward_context(current_timestep=i,
+                                    attn_metadata=None,
+                                    forward_batch=batch):
+                t_expanded_noise = t_cur * torch.ones(
+                    (latent_model_input.shape[0], 1),
+                    device=latent_model_input.device,
+                    dtype=torch.long)
+                pred_noise_btchw = self.transformer(
+                    latent_model_input,
+                    st["prompt_embeds"],
+                    t_expanded_noise,
+                    kv_cache=st["kv_cache"],
+                    crossattn_cache=st["crossattn_cache"],
+                    current_start=start_index * self.frame_seq_length,
+                    start_frame=start_index,
+                    y=current_y,
+                    max_attention_size=st["max_attention_size"],
+                ).permute(0, 2, 1, 3, 4)
+
+            pred_video_btchw = pred_noise_to_pred_video(
+                pred_noise=pred_noise_btchw.flatten(0, 1),
+                noise_input_latent=noise_latents.flatten(0, 1),
+                timestep=t_expand,
+                scheduler=self.scheduler).unflatten(
+                    0, pred_noise_btchw.shape[:2])
+
+            if i < len(timesteps) - 1:
+                next_timestep = timesteps[i + 1] * torch.ones(
+                    [1], dtype=torch.long,
+                    device=pred_video_btchw.device)
+                noise = torch.randn(
+                    video_raw_latent_shape,
+                    dtype=pred_video_btchw.dtype,
+                    generator=(batch.generator[0] if isinstance(
+                        batch.generator, list) else
+                               batch.generator)).to(latents.device)
+                noise_latents_btchw = self.scheduler.add_noise(
+                    pred_video_btchw.flatten(0, 1),
+                    noise.flatten(0, 1), next_timestep).unflatten(
+                        0, pred_video_btchw.shape[:2])
+                current_latents = noise_latents_btchw.permute(
+                    0, 2, 1, 3, 4)
+            else:
+                current_latents = pred_video_btchw.permute(0, 2, 1, 3, 4)
+
+        latents[:, :, start_index:start_index +
+                current_num_frames] = current_latents
+
+        # Refresh KV cache with the clean chunk at timestep 0
+        context_noise = getattr(fastvideo_args.pipeline_config,
+                                "context_noise", 0)
+        t_context = torch.ones([b, 1],
+                               device=latents.device,
+                               dtype=torch.long) * int(context_noise)
+        with torch.autocast(device_type="cuda",
+                            dtype=target_dtype,
+                            enabled=autocast_enabled), \
+            set_forward_context(current_timestep=0,
+                                attn_metadata=None,
+                                forward_batch=batch):
+            self.transformer(
+                current_latents.to(target_dtype),
+                st["prompt_embeds"],
+                t_context,
+                kv_cache=st["kv_cache"],
+                crossattn_cache=st["crossattn_cache"],
+                current_start=start_index * self.frame_seq_length,
+                start_frame=start_index,
+                y=current_y,
+                max_attention_size=st["max_attention_size"],
+            )
+
+        st["start_index"] = start_index + current_num_frames
+        st["block_idx"] += 1
+        batch.latents = latents
+        return batch
+
+    def streaming_clear(self) -> None:
+        st = self._stream
+        if st is None:
+            return
+        for entry in st.get("kv_cache", []):
+            entry.clear()
+        for entry in st.get("crossattn_cache", []):
+            entry.clear()
+        self._stream = None
+        torch.cuda.empty_cache()
+
     def _initialize_full_kv_cache(self, batch_size, num_latent_frames,
                                   dtype, device) -> list[dict]:
         """Allocate a KV cache covering the full video.
@@ -502,6 +723,49 @@ class LingBotWorldCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
 
         self.add_stage(stage_name="decoding_stage",
                        stage=TAEHVDecodingStage(vae=self.get_module("vae")))
+
+    # ---- Streaming session interface (Phase 4) ----
+
+    @torch.no_grad()
+    def streaming_reset(self, batch: ForwardBatch,
+                        fastvideo_args: FastVideoArgs) -> None:
+        if not self.post_init_called:
+            self.post_init()
+        for stage_name in ("input_validation_stage",
+                           "prompt_encoding_stage", "conditioning_stage",
+                           "latent_preparation_stage"):
+            if stage_name in self._stage_name_mapping:
+                batch = self._stage_name_mapping[stage_name].forward(
+                    batch, fastvideo_args)
+        self._stage_name_mapping["denoising_stage"].streaming_reset(
+            batch, fastvideo_args)
+
+    @torch.no_grad()
+    def streaming_step(self, keyboard_action,
+                       mouse_action) -> ForwardBatch:
+        denoiser = self._stage_name_mapping["denoising_stage"]
+        st = denoiser._stream
+        assert st is not None, "call streaming_reset first"
+        start = st["start_index"]
+        batch = denoiser.streaming_step(keyboard_action, mouse_action)
+        end = denoiser._stream["start_index"] if denoiser._stream else start
+        output = None
+        if end > start:
+            chunk = st["latents"][:, :, start:end]
+            decoder = self._stage_name_mapping["decoding_stage"]
+            # .cpu(): the result crosses the executor process boundary
+            # via a multiprocessing queue; CUDA tensors would go
+            # through CUDA IPC, which fails under
+            # expandable_segments:True (required for torch.compile on
+            # 32GB) and would also drag the whole multi-GB session
+            # state across. Ship only the decoded pixel chunk.
+            output = decoder.decode(chunk, st["fastvideo_args"]).cpu()
+        return ForwardBatch(data_type=batch.data_type, output=output)
+
+    def streaming_clear(self) -> None:
+        denoiser = self._stage_name_mapping.get("denoising_stage")
+        if denoiser is not None and hasattr(denoiser, "streaming_clear"):
+            denoiser.streaming_clear()
 
 
 EntryClass = LingBotWorldCausalDMDPipeline
