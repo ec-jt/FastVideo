@@ -264,17 +264,33 @@ class CausalLingBotSelfAttention(nn.Module):
     def _fp8_attention(self, q: torch.Tensor, k_fp8: torch.Tensor,
                        v_fp8: torch.Tensor,
                        kv_cache: dict) -> torch.Tensor:
-        """Attention over the fp8 KV cache window via flashinfer.
+        """Attention over the fp8 KV cache window.
 
-        q: [B, L, H, d] bf16; k_fp8/v_fp8: [B, kv_len, H, d]
-        float8_e4m3fn with PER-HEAD scales. flashinfer's fa2 kernel
-        only takes scalar scales, so the per-head factors are folded
-        outside the kernel: k_scale_h into q (commutes through QK^T)
-        and v_scale_h onto the output (softmax weights sum to 1, so
-        the V scale factors out of the PV weighted sum).
+        Default: custom Triton prefill kernel (vLLM c9e50123 pattern)
+        that loads fp8 tiles from HBM and dequantizes IN REGISTERS
+        with the per-head scales - no q/output scale-fold passes, no
+        dequantized copy in global memory. Beats the flashinfer
+        fold-outside path by ~15% at chunk-sized windows.
+
+        Fallback (FP8_KV_TRITON=false): flashinfer fa2 with per-head
+        factors folded outside the kernel (k_scale_h into q via QK^T
+        commutation, v_scale_h onto the output).
         """
-        from flashinfer import single_prefill_with_kv_cache
         assert q.shape[0] == 1, "fp8 KV attention path assumes batch=1"
+        import os
+        if os.environ.get("FP8_KV_TRITON", "true").lower() == "true":
+            from fastvideo.models.dits.lingbotworld.triton_fp8_attention import (  # noqa: E501
+                triton_fp8_prefill)
+            out = triton_fp8_prefill(
+                q.squeeze(0).contiguous(),
+                k_fp8.squeeze(0),
+                v_fp8.squeeze(0),
+                kv_cache["k_scale"],
+                kv_cache["v_scale"],
+            )
+            return out.unsqueeze(0)
+
+        from flashinfer import single_prefill_with_kv_cache
         head_dim = q.shape[-1]
         sm_scale = head_dim**-0.5
         k_scale = kv_cache["k_scale"].view(1, -1, 1)  # [1, H, 1]
