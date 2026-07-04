@@ -354,16 +354,21 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
 
         cache = []
         for _ in range(self.num_transformer_blocks):
+            # torch.empty, not zeros: the attention read window
+            # [local_end - max_attention_size, local_end] only ever
+            # covers previously written tokens, so zero-init is pure
+            # overhead (nsys showed the FillFunctor memsets at ~4% of
+            # GPU time, re-issued for every generation).
             entry = {
                 "k":
-                torch.zeros([
+                torch.empty([
                     batch_size, kv_cache_size, num_attention_heads,
                     attention_head_dim
                 ],
                             dtype=kv_dtype,
                             device=device),
                 "v":
-                torch.zeros([
+                torch.empty([
                     batch_size, kv_cache_size, num_attention_heads,
                     attention_head_dim
                 ],
