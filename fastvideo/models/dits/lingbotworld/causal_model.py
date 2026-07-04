@@ -141,14 +141,44 @@ class CausalLingBotSelfAttention(nn.Module):
         # The kernel then runs with k_scale=v_scale=1.
         fp8_kv = kv_cache["k"].dtype == torch.float8_e4m3fn
         if fp8_kv:
-            if float(kv_cache["k_scale"].amax().item()) == 0.0:
-                # [H] per-head absmax over (batch, seq, dim)
-                kv_cache["k_scale"].copy_(
-                    (roped_key.float().abs().amax(dim=(0, 1, 3)) /
-                     448.0).clamp(min=1e-6))
-                kv_cache["v_scale"].copy_(
-                    (v.float().abs().amax(dim=(0, 1, 3)) /
-                     448.0).clamp(min=1e-6))
+            # Growth-only running-max recalibration. The original
+            # first-chunk absmax calibration clamped later chunks at
+            # +-448 whenever activations exceeded the initial range
+            # (user-visible quality loss on long rollouts). Now every
+            # write updates the per-head scale; when a head's range
+            # grows, the already-cached fp8 content for that head is
+            # rescaled in place (dequant-requant by old/new ratio -
+            # values only SHRINK, so no clamping, and the rescale
+            # fires rarely once ranges stabilize).
+            k_new = (roped_key.float().abs().amax(dim=(0, 1, 3)) /
+                     448.0).clamp(min=1e-6)
+            v_new = (v.float().abs().amax(dim=(0, 1, 3)) /
+                     448.0).clamp(min=1e-6)
+            valid = int(kv_cache["local_end_index"].item())
+            for name, new_scale in (("k_scale", k_new), ("v_scale",
+                                                         v_new)):
+                old_scale = kv_cache[name]
+                grew = new_scale > old_scale
+                if bool(grew.any().item()):
+                    if valid > 0:
+                        buf = kv_cache[name[0]]  # "k" or "v"
+                        ratio = torch.where(
+                            grew, old_scale /
+                            new_scale.clamp(min=1e-6),
+                            torch.ones_like(old_scale)).view(
+                                1, 1, -1, 1).to(torch.bfloat16)
+                        # Rescale in small token-slices with bf16
+                        # arithmetic: upcasting a multi-GB fp8 cache
+                        # in one shot would transiently allocate 2-4x
+                        # its size and OOM at the 81f memory ceiling.
+                        step = 8192
+                        for s in range(0, valid, step):
+                            e = min(s + step, valid)
+                            buf[:, s:e] = (
+                                buf[:, s:e].to(torch.bfloat16) *
+                                ratio).to(torch.float8_e4m3fn)
+                    kv_cache[name].copy_(
+                        torch.maximum(old_scale, new_scale))
             k_scale = kv_cache["k_scale"].view(1, 1, -1, 1)
             v_scale = kv_cache["v_scale"].view(1, 1, -1, 1)
             k_write = (roped_key.float() / k_scale).clamp(-448, 448).to(
