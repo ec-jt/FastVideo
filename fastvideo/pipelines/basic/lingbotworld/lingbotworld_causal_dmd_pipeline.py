@@ -371,6 +371,26 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
         if not isinstance(prompt_embeds, torch.Tensor):
             prompt_embeds = prompt_embeds[0]
 
+        # Unbounded sessions: LINGBOT_STREAM_WINDOW=<latent frames>
+        # switches the attention layers from full-video KV
+        # (local_attn_size=-1) to a ROLLING window with the first
+        # sink_size frames (config: 9) pinned as an attention sink -
+        # the roll logic already exists in
+        # CausalLingBotSelfAttention.forward. Memory then stays
+        # constant regardless of session length; num_frames only sets
+        # how much conditioning/noise is pre-built, not a session cap.
+        window = int(os.environ.get("LINGBOT_STREAM_WINDOW", "0") or 0)
+        unbounded = window > 0
+        if unbounded:
+            window = max(window,
+                         self.sink_size + 2 * self.num_frames_per_block)
+            self.local_attn_size = window
+            for blk in self.transformer.blocks:
+                blk.attn1.local_attn_size = window
+            logger.info(
+                "[LingBot-Fast] unbounded streaming: rolling KV window "
+                "%d latent frames (sink %d)", window, self.sink_size)
+
         y = self._encode_conditioning(batch, fastvideo_args, t, h, w,
                                       target_dtype)
 
@@ -397,7 +417,11 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
             "timesteps": timesteps,
             "start_index": 0,
             "block_idx": 0,
-            "num_blocks": t // self.num_frames_per_block,
+            "num_blocks": (10**9 if unbounded else
+                           t // self.num_frames_per_block),
+            "unbounded": unbounded,
+            "encoded_frames": t,
+            "last_chunk_latents": None,
             "target_dtype": target_dtype,
             "autocast_enabled": autocast_enabled,
             "max_attention_size": kv_cache[0]["k"].shape[1],
@@ -502,9 +526,27 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
         current_num_frames = self.num_frames_per_block
         b = latents.shape[0]
 
-        current_latents = latents[:, :, start_index:start_index +
-                                  current_num_frames]
-        current_y = y[:, :, start_index:start_index + current_num_frames]
+        enc = st["encoded_frames"]
+        in_range = start_index + current_num_frames <= enc
+        if in_range:
+            current_latents = latents[:, :, start_index:start_index +
+                                      current_num_frames]
+            current_y = y[:, :, start_index:start_index +
+                          current_num_frames]
+        else:
+            # Unbounded continuation past the pre-encoded range: fresh
+            # noise for the chunk; conditioning reuses the LAST encoded
+            # y slice (mask channels are zero and the VAE conditioning
+            # encodes the zero-padded video for every frame > 0, so the
+            # tail slice is the correct steady-state conditioning).
+            gen = (batch.generator[0] if isinstance(
+                batch.generator, list) else batch.generator)
+            current_latents = torch.randn(
+                (b, latents.shape[1], current_num_frames,
+                 latents.shape[3], latents.shape[4]),
+                dtype=latents.dtype,
+                generator=gen).to(latents.device)
+            current_y = y[:, :, enc - current_num_frames:enc]
 
         c2ws_plucker_emb = None
         if mouse_action is not None:
@@ -568,8 +610,10 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
             else:
                 current_latents = pred_video_btchw.permute(0, 2, 1, 3, 4)
 
-        latents[:, :, start_index:start_index +
-                current_num_frames] = current_latents
+        if in_range:
+            latents[:, :, start_index:start_index +
+                    current_num_frames] = current_latents
+        st["last_chunk_latents"] = current_latents
 
         # Refresh KV cache with the clean chunk at timestep 0
         context_noise = getattr(fastvideo_args.pipeline_config,
@@ -819,10 +863,12 @@ class LingBotWorldCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
         assert st is not None, "call streaming_reset first"
         start = st["start_index"]
         batch = denoiser.streaming_step(keyboard_action, mouse_action)
-        end = denoiser._stream["start_index"] if denoiser._stream else start
+        st2 = denoiser._stream
+        end = st2["start_index"] if st2 else start
         output = None
-        if end > start:
-            chunk = st["latents"][:, :, start:end]
+        if end > start and st2 is not None and \
+                st2["last_chunk_latents"] is not None:
+            chunk = st2["last_chunk_latents"]
             decoder = self._stage_name_mapping["decoding_stage"]
             # .cpu(): the result crosses the executor process boundary
             # via a multiprocessing queue; CUDA tensors would go
@@ -830,7 +876,7 @@ class LingBotWorldCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
             # expandable_segments:True (required for torch.compile on
             # 32GB) and would also drag the whole multi-GB session
             # state across. Ship only the decoded pixel chunk.
-            output = decoder.decode(chunk, st["fastvideo_args"]).cpu()
+            output = decoder.decode(chunk, st2["fastvideo_args"]).cpu()
         return ForwardBatch(data_type=batch.data_type, output=output)
 
     def streaming_clear(self) -> None:
