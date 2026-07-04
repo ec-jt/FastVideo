@@ -401,12 +401,75 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
             "target_dtype": target_dtype,
             "autocast_enabled": autocast_enabled,
             "max_attention_size": kv_cache[0]["k"].shape[1],
+            # Camera-control session state. prev_c2w carries the
+            # absolute pose of the previous chunk's last latent frame
+            # so framewise relative poses are continuous across steps.
+            "height": batch.height,
+            "width": batch.width,
+            "prev_c2w": torch.eye(4, dtype=torch.float32),
+            "Ks": torch.tensor(
+                [batch.width / 2.0, batch.width / 2.0,
+                 batch.width / 2.0, batch.height / 2.0],
+                dtype=torch.float32),
         }
         logger.info(
             "[LingBot-Fast] streaming session: %d chunks of %d latent "
             "frames (%dx%d)", self._stream["num_blocks"],
             self.num_frames_per_block, h, w)
         return batch
+
+    def _plucker_chunk(self, poses_pix: torch.Tensor,
+                       st: dict) -> torch.Tensor:
+        """Build the per-chunk camera Plucker embedding.
+
+        poses_pix: [F, 4, 4] ABSOLUTE c2w poses (OpenCV convention,
+        same as the official poses.npy) covering this chunk's pixel
+        frames at any granularity F >= 1. They are interpolated to
+        the chunk's latent frames, converted to framewise RELATIVE
+        poses continuing from the previous chunk's last pose
+        (st["prev_c2w"]), translation-normalized per chunk (official
+        compute_relative_poses behavior), and Plucker-embedded to
+        [1, 6*64, F_lat, H_lat, W_lat] - the layout the transformer's
+        c2ws_plucker_emb kwarg expects.
+        """
+        import numpy as np
+
+        from fastvideo.models.dits.lingbotworld.cam_utils import (
+            SE3_inverse, get_plucker_embeddings, interpolate_camera_poses)
+
+        n_lat = self.num_frames_per_block
+        poses_pix = poses_pix.detach().to("cpu", torch.float32)
+        f = poses_pix.shape[0]
+        if f == 1:
+            poses_pix = poses_pix.repeat(2, 1, 1)
+            f = 2
+        p = interpolate_camera_poses(
+            src_indices=np.linspace(0, f - 1, f),
+            src_rot_mat=poses_pix[:, :3, :3].numpy(),
+            src_trans_vec=poses_pix[:, :3, 3].numpy(),
+            tgt_indices=np.linspace(0, f - 1, n_lat),
+        ).to(torch.float32)  # [n_lat, 4, 4]
+
+        seq = torch.cat([st["prev_c2w"].unsqueeze(0), p], dim=0)
+        rel = torch.bmm(SE3_inverse(seq[:-1]), seq[1:])  # [n_lat,4,4]
+        if st["block_idx"] == 0:
+            rel[0] = torch.eye(4, dtype=torch.float32)
+        trans = rel[:, :3, 3]
+        max_norm = torch.norm(trans, dim=-1).max()
+        if max_norm > 0:
+            rel[:, :3, 3] = trans / max_norm
+        st["prev_c2w"] = p[-1]
+
+        height, width = st["height"], st["width"]
+        Ks = st["Ks"].unsqueeze(0).repeat(n_lat, 1)
+        plucker = get_plucker_embeddings(rel, Ks, height,
+                                         width)  # [n, H, W, 6]
+        s = 8  # VAE spatial stride
+        lh, lw = height // s, width // s
+        plucker = plucker.view(n_lat, lh, s, lw, s, 6)
+        plucker = plucker.permute(0, 1, 3, 5, 2, 4).contiguous()
+        plucker = plucker.view(n_lat, lh, lw, 6 * s * s)
+        return plucker.permute(3, 0, 1, 2).contiguous().unsqueeze(0)
 
     @torch.no_grad()
     def streaming_step(self,
@@ -415,10 +478,11 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
                        ) -> ForwardBatch:
         """Denoise ONE chunk (4 DMD steps + t=0 cache refresh).
 
-        keyboard_action/mouse_action are accepted for executor
-        interface compatibility; camera conditioning
-        (c2ws_plucker_emb) is the LingBot control channel and will be
-        threaded through in the follow-up.
+        mouse_action carries the LingBot camera control: an optional
+        [F, 4, 4] tensor of absolute c2w poses for this chunk (any
+        F >= 1; interpolated to the 3 latent frames). None = static
+        camera. keyboard_action is reserved (WASD-to-pose mapping
+        happens in the worker API layer).
         """
         st = self._stream
         if st is None:
@@ -441,6 +505,11 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
         current_latents = latents[:, :, start_index:start_index +
                                   current_num_frames]
         current_y = y[:, :, start_index:start_index + current_num_frames]
+
+        c2ws_plucker_emb = None
+        if mouse_action is not None:
+            c2ws_plucker_emb = self._plucker_chunk(mouse_action,
+                                                   st).to(latents.device)
 
         noise_latents_btchw = current_latents.permute(0, 2, 1, 3, 4)
         video_raw_latent_shape = noise_latents_btchw.shape
@@ -470,6 +539,7 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
                     start_frame=start_index,
                     y=current_y,
                     max_attention_size=st["max_attention_size"],
+                    c2ws_plucker_emb=c2ws_plucker_emb,
                 ).permute(0, 2, 1, 3, 4)
 
             pred_video_btchw = pred_noise_to_pred_video(
@@ -523,6 +593,7 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
                 start_frame=start_index,
                 y=current_y,
                 max_attention_size=st["max_attention_size"],
+                c2ws_plucker_emb=c2ws_plucker_emb,
             )
 
         st["start_index"] = start_index + current_num_frames
