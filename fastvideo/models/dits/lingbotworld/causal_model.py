@@ -15,6 +15,7 @@ Differences from ``LingBotWorldTransformer3DModel`` (base-cam):
 """
 
 import math
+import os
 from typing import Any
 
 import torch
@@ -150,10 +151,33 @@ class CausalLingBotSelfAttention(nn.Module):
             # rescaled in place (dequant-requant by old/new ratio -
             # values only SHRINK, so no clamping, and the rescale
             # fires rarely once ranges stabilize).
-            k_new = (roped_key.float().abs().amax(dim=(0, 1, 3)) /
-                     448.0).clamp(min=1e-6)
-            v_new = (v.float().abs().amax(dim=(0, 1, 3)) /
-                     448.0).clamp(min=1e-6)
+            #
+            # FP8_KV_PERCENTILE (e.g. "0.999"): calibrate the per-head
+            # scale on that abs-value quantile instead of absmax. A
+            # single outlier no longer stretches the head's whole e4m3
+            # grid; values beyond the percentile clamp at +-448 (rare
+            # by construction) while the bulk of the distribution gets
+            # a finer grid. Standard KV-quant tradeoff; env-gated for
+            # visual A/B.
+            pct = float(os.environ.get("FP8_KV_PERCENTILE", "0") or 0)
+            if 0.0 < pct < 1.0:
+                # Subsample tokens 4x to bound the per-write quantile
+                # (sort) cost; K/V head ranges are statistically
+                # stationary across tokens so the subsample is
+                # representative.
+                k_abs = roped_key[:, ::4].float().abs()
+                v_abs = v[:, ::4].float().abs()
+                k_new = (k_abs.permute(2, 0, 1, 3).reshape(
+                    k_abs.shape[2], -1).quantile(pct, dim=1) /
+                         448.0).clamp(min=1e-6)
+                v_new = (v_abs.permute(2, 0, 1, 3).reshape(
+                    v_abs.shape[2], -1).quantile(pct, dim=1) /
+                         448.0).clamp(min=1e-6)
+            else:
+                k_new = (roped_key.float().abs().amax(dim=(0, 1, 3)) /
+                         448.0).clamp(min=1e-6)
+                v_new = (v.float().abs().amax(dim=(0, 1, 3)) /
+                         448.0).clamp(min=1e-6)
             valid = int(kv_cache["local_end_index"].item())
             for name, new_scale in (("k_scale", k_new), ("v_scale",
                                                          v_new)):
@@ -277,7 +301,6 @@ class CausalLingBotSelfAttention(nn.Module):
         commutation, v_scale_h onto the output).
         """
         assert q.shape[0] == 1, "fp8 KV attention path assumes batch=1"
-        import os
         if os.environ.get("FP8_KV_TRITON", "true").lower() == "true":
             from fastvideo.models.dits.lingbotworld.triton_fp8_attention import (  # noqa: E501
                 triton_fp8_prefill)
