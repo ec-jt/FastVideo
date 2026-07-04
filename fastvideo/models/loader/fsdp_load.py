@@ -68,6 +68,70 @@ def _maybe_quantize_model(model: nn.Module) -> None:
             return
 
 
+_NVFP4_BUFFER_SUFFIXES = (
+    "_nvfp4_weight",
+    "_nvfp4_weight_scale",
+    "_weight_global_sf",
+    "_nvfp4_alpha",
+)
+
+
+def load_prequantized_nvfp4(model: nn.Module, checkpoint_path: str,
+                            device: torch.device,
+                            param_dtype: torch.dtype) -> None:
+    """Load a prequantized NVFP4 checkpoint directly onto the GPU.
+
+    The checkpoint (written by
+    ``scripts/checkpoint_conversion/convert_lingbot_nvfp4.py``) stores
+    CUSTOM-named entries: per-layer fp4 payloads
+    (``<module>._nvfp4_weight`` etc.) for the quantized linears, and
+    plain bf16 tensors for everything else. Loading it skips the 37GB
+    dense read + on-the-fly quantization entirely (~9-11GB read).
+
+    fp4 buffers are registered on their modules (mirroring
+    ``convert_model_to_nvfp4``) and the corresponding dense ``weight``
+    Parameters are dropped; remaining params load with ``assign=True``.
+    Params missing from the checkpoint are zero-initialized.
+    """
+    from safetensors import safe_open
+
+    modules = dict(model.named_modules())
+    sharded_sd: dict[str, nn.Parameter] = {}
+    with safe_open(checkpoint_path, framework="pt",
+                   device=str(device)) as f:
+        for key in f.keys():
+            last = key.rsplit(".", 1)[-1]
+            tensor = f.get_tensor(key)
+            if last in _NVFP4_BUFFER_SUFFIXES:
+                module_name = key[:-(len(last) + 1)]
+                mod = modules[module_name]
+                mod.register_buffer(last, tensor, persistent=False)
+                if last == "_nvfp4_weight" and "weight" in mod._parameters:
+                    del mod._parameters["weight"]
+            else:
+                if tensor.is_floating_point():
+                    tensor = tensor.to(dtype=param_dtype)
+                sharded_sd[key] = nn.Parameter(tensor,
+                                               requires_grad=False)
+
+    # Zero-init anything the checkpoint does not provide (state_dict is
+    # taken AFTER dense-weight deletion so dropped weights are absent).
+    missing = set(model.state_dict().keys()) - set(sharded_sd.keys())
+    if missing:
+        logger.warning(
+            "Prequantized NVFP4 load: zero-initializing %d params not "
+            "in checkpoint: %s", len(missing), sorted(missing)[:8])
+    for name in missing:
+        meta_param = model.state_dict()[name]
+        sharded_sd[name] = nn.Parameter(torch.zeros_like(
+            meta_param, device=device, dtype=param_dtype),
+                                        requires_grad=False)
+
+    model.load_state_dict(sharded_sd, strict=False, assign=True)
+    logger.info("Loaded prequantized NVFP4 checkpoint from %s",
+                checkpoint_path)
+
+
 # TODO(PY): move this to utils elsewhere
 @contextlib.contextmanager
 def set_default_dtype(dtype: torch.dtype) -> Generator[None, None, None]:
@@ -176,17 +240,27 @@ def maybe_load_fsdp_model(
                     fsdp_shard_conditions=model._fsdp_shard_conditions,
                     pin_cpu_memory=pin_cpu_memory)
 
-    weight_iterator = safetensors_weights_iterator(weight_dir_list, to_cpu=True)
-    param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
-    load_model_from_full_model_state_dict(
-        model,
-        weight_iterator,
-        device,
-        default_dtype,
-        strict=strict,
-        cpu_offload=cpu_offload,
-        param_names_mapping=param_names_mapping_fn,
-    )
+    # Prequantized NVFP4 fast path: fp4 payloads + dense leftovers load
+    # straight to the GPU, skipping the 37GB dense read + on-the-fly
+    # quantization. Only valid without FSDP sharding (single-rank
+    # resident weights).
+    prequant_path = os.environ.get("NVFP4_PREQUANT_PATH", "")
+    if (prequant_path and os.path.isfile(prequant_path) and not use_fsdp
+            and not training_mode):
+        load_prequantized_nvfp4(model, prequant_path, device,
+                                default_dtype)
+    else:
+        weight_iterator = safetensors_weights_iterator(weight_dir_list, to_cpu=True)
+        param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
+        load_model_from_full_model_state_dict(
+            model,
+            weight_iterator,
+            device,
+            default_dtype,
+            strict=strict,
+            cpu_offload=cpu_offload,
+            param_names_mapping=param_names_mapping_fn,
+        )
     if hasattr(model, "materialize_non_persistent_buffers"):
         model.materialize_non_persistent_buffers(
             device=device, dtype=default_dtype)
