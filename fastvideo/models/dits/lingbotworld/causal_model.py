@@ -140,8 +140,24 @@ class CausalLingBotSelfAttention(nn.Module):
         #   PV:   out_h' = out_h * v_scale_h (softmax weights sum to 1,
         #         so the V scale factors out of the weighted sum)
         # The kernel then runs with k_scale=v_scale=1.
+        # LINGBOT_CUDA_GRAPH: manual CUDA-graph capture of the steady
+        # rolled streaming state. During capture/replay no host sync is
+        # allowed, so cache positions come from PYTHON ints kept in the
+        # cache dict (py_global_end/py_local_end) instead of tensor
+        # .item() reads, tensor position updates are skipped (baked
+        # constants are stable in the steady rolled state), and fp8
+        # scale recalibration is frozen (kv_cache["freeze_scales"]).
+        graph_mode = os.environ.get("LINGBOT_CUDA_GRAPH",
+                                    "false").lower() == "true"
         fp8_kv = kv_cache["k"].dtype == torch.float8_e4m3fn
-        if fp8_kv:
+        if fp8_kv and kv_cache.get("freeze_scales"):
+            k_scale = kv_cache["k_scale"].view(1, 1, -1, 1)
+            v_scale = kv_cache["v_scale"].view(1, 1, -1, 1)
+            k_write = (roped_key.float() / k_scale).clamp(-448, 448).to(
+                torch.float8_e4m3fn)
+            v_write = (v.float() / v_scale).clamp(-448, 448).to(
+                torch.float8_e4m3fn)
+        elif fp8_kv:
             # Growth-only running-max recalibration. The original
             # first-chunk absmax calibration clamped later chunks at
             # +-448 whenever activations exceeded the initial range
@@ -178,7 +194,8 @@ class CausalLingBotSelfAttention(nn.Module):
                          448.0).clamp(min=1e-6)
                 v_new = (v.float().abs().amax(dim=(0, 1, 3)) /
                          448.0).clamp(min=1e-6)
-            valid = int(kv_cache["local_end_index"].item())
+            valid = (kv_cache.get("py_local_end", 0) if graph_mode else
+                     int(kv_cache["local_end_index"].item()))
             for name, new_scale in (("k_scale", k_new), ("v_scale",
                                                          v_new)):
                 old_scale = kv_cache[name]
@@ -224,8 +241,12 @@ class CausalLingBotSelfAttention(nn.Module):
             else:
                 max_attention_size = self.local_attn_size * frame_seqlen
 
-        global_end_index = int(kv_cache["global_end_index"].item())
-        local_end_index_prev = int(kv_cache["local_end_index"].item())
+        if graph_mode:
+            global_end_index = kv_cache.get("py_global_end", 0)
+            local_end_index_prev = kv_cache.get("py_local_end", 0)
+        else:
+            global_end_index = int(kv_cache["global_end_index"].item())
+            local_end_index_prev = int(kv_cache["local_end_index"].item())
 
         if self.local_attn_size == -1:
             # Global attention: cache covers the full video.
@@ -274,8 +295,12 @@ class CausalLingBotSelfAttention(nn.Module):
         else:
             x = self.attn(roped_query, key_window, value_window)
 
-        kv_cache["global_end_index"].fill_(current_end)
-        kv_cache["local_end_index"].fill_(local_end_index)
+        if graph_mode:
+            kv_cache["py_global_end"] = current_end
+            kv_cache["py_local_end"] = local_end_index
+        else:
+            kv_cache["global_end_index"].fill_(current_end)
+            kv_cache["local_end_index"].fill_(local_end_index)
 
         if sp_size > 1:
             # [B, L_full, H/P, d] -> [B, L_local, H, d]
@@ -601,6 +626,27 @@ class CausalLingBotWorldTransformer3DModel(BaseDiT):
 
         self.__post_init__()
 
+    def _compute_rope(self, post_patch_num_frames: int,
+                      post_patch_height: int, post_patch_width: int,
+                      start_frame: int,
+                      device: torch.device) -> tuple[torch.Tensor,
+                                                     torch.Tensor]:
+        """fp64-accurate RoPE table, returned as fp32 on device."""
+        d = self.hidden_size // self.num_attention_heads
+        rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
+        freqs_cos, freqs_sin = get_rotary_pos_embed(
+            (post_patch_num_frames, post_patch_height, post_patch_width),
+            self.hidden_size,
+            self.num_attention_heads,
+            rope_dim_list,
+            dtype=(torch.float32
+                   if current_platform.is_mps() else torch.float64),
+            rope_theta=10000,
+            start_frame=start_frame,
+        )
+        return (freqs_cos.to(device=device, dtype=torch.float32),
+                freqs_sin.to(device=device, dtype=torch.float32))
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -659,39 +705,35 @@ class CausalLingBotWorldTransformer3DModel(BaseDiT):
         # float32: leaving cos/sin in float64 silently promotes the
         # whole RoPE apply over q/k to double precision every forward
         # (~7% of GPU time in the nsys profile).
-        rope_key = (post_patch_num_frames, post_patch_height,
-                    post_patch_width, int(start_frame))
-        rope_cache = getattr(self, "_rope_cache", None)
-        if rope_cache is None:
-            rope_cache = {}
-            self._rope_cache = rope_cache
-        cached = rope_cache.get(rope_key)
-        if cached is None:
-            d = self.hidden_size // self.num_attention_heads
-            rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
-            freqs_cos, freqs_sin = get_rotary_pos_embed(
-                (post_patch_num_frames, post_patch_height,
-                 post_patch_width),
-                self.hidden_size,
-                self.num_attention_heads,
-                rope_dim_list,
-                dtype=(torch.float32
-                       if current_platform.is_mps() else torch.float64),
-                rope_theta=10000,
-                start_frame=start_frame,
-            )
-            freqs_cos = freqs_cos.to(device=hidden_states.device,
-                                     dtype=torch.float32)
-            freqs_sin = freqs_sin.to(device=hidden_states.device,
-                                     dtype=torch.float32)
-            # Bounded cache: chunked generation revisits few distinct
-            # (shape, start_frame) keys, but guard against unbounded
-            # growth in long interactive sessions.
-            if len(rope_cache) > 64:
-                rope_cache.clear()
-            rope_cache[rope_key] = (freqs_cos, freqs_sin)
+        #
+        # CUDA-graph mode: replay skips ALL python, so per-chunk tables
+        # must live at a FIXED address. When `_static_rope` buffers are
+        # installed (by the streaming graph harness, which copies the
+        # chunk's table in before each replay), use them directly.
+        static_rope = getattr(self, "_static_rope", None)
+        if static_rope is not None:
+            freqs_cos, freqs_sin = static_rope
         else:
-            freqs_cos, freqs_sin = cached
+            rope_key = (post_patch_num_frames, post_patch_height,
+                        post_patch_width, int(start_frame))
+            rope_cache = getattr(self, "_rope_cache", None)
+            if rope_cache is None:
+                rope_cache = {}
+                self._rope_cache = rope_cache
+            cached = rope_cache.get(rope_key)
+            if cached is None:
+                freqs_cos, freqs_sin = self._compute_rope(
+                    post_patch_num_frames, post_patch_height,
+                    post_patch_width, start_frame,
+                    hidden_states.device)
+                # Bounded cache: chunked generation revisits few
+                # distinct (shape, start_frame) keys, but guard against
+                # unbounded growth in long interactive sessions.
+                if len(rope_cache) > 64:
+                    rope_cache.clear()
+                rope_cache[rope_key] = (freqs_cos, freqs_sin)
+            else:
+                freqs_cos, freqs_sin = cached
         freqs_cis = (freqs_cos, freqs_sin)
 
         hidden_states = self.patch_embedding(hidden_states)

@@ -150,7 +150,13 @@ def timestep_embedding(t: torch.Tensor,
         Tensor of shape [B, dim] with embeddings
     """
     half = dim // 2
-    freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=dtype) / half).to(device=t.device)
+    # arange directly on t's device: creating it on CPU and calling
+    # .to(device) issues an unpinned host-to-device copy every forward,
+    # which is wasteful and ILLEGAL inside CUDA graph capture.
+    freqs = torch.exp(
+        -math.log(max_period) *
+        torch.arange(start=0, end=half, dtype=dtype, device=t.device) /
+        half)
     args = t[:, None].float() * freqs[None]
     embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
     if dim % 2:

@@ -442,6 +442,167 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
             self.num_frames_per_block, h, w)
         return batch
 
+    def _transformer_step(self, st: dict, latent_in: torch.Tensor,
+                          t_tensor: torch.Tensor, start_index: int,
+                          current_y: torch.Tensor,
+                          c2ws: torch.Tensor | None,
+                          fwd_idx: int) -> torch.Tensor:
+        """Run one transformer forward, optionally via CUDA graph.
+
+        LINGBOT_CUDA_GRAPH=true + unbounded window sessions: once the
+        rolling KV cache reaches steady state (write positions repeat
+        every chunk), capture TWO graphs with static input buffers
+        (latents, y, timestep, plucker, RoPE tables):
+
+          "roll":      the chunk's FIRST forward, which shifts the
+                       window (evict oldest, keep sink) then writes.
+          "overwrite": forwards 2..5 (remaining DMD steps + the t=0
+                       refresh), which overwrite the same slot.
+
+        Replays eliminate all eager launch/gap overhead between the
+        ~1600 kernels per forward. Cache position bookkeeping runs on
+        PYTHON ints (kv_cache py_global_end/py_local_end, maintained
+        here between replays) and fp8 scale recalibration is frozen -
+        both are host syncs that are illegal inside capture and
+        unnecessary at steady state. Pre-steady chunks and non-graph
+        configs run the normal eager/compiled path.
+        """
+        graph_env = os.environ.get("LINGBOT_CUDA_GRAPH",
+                                   "false").lower() == "true"
+        use_plucker = c2ws is not None
+        chunk_tokens = self.frame_seq_length * self.num_frames_per_block
+        window_tokens = st["max_attention_size"]
+        steady = (st.get("unbounded", False)
+                  and st["block_idx"] * chunk_tokens >= window_tokens)
+
+        def eager():
+            return self.transformer(
+                latent_in,
+                st["prompt_embeds"],
+                t_tensor,
+                kv_cache=st["kv_cache"],
+                crossattn_cache=st["crossattn_cache"],
+                current_start=start_index * self.frame_seq_length,
+                start_frame=start_index,
+                y=current_y,
+                max_attention_size=st["max_attention_size"],
+                c2ws_plucker_emb=c2ws,
+            )
+
+        if not (graph_env and steady):
+            return eager()
+
+        g = st.setdefault("_graph", {})
+        model = self.transformer
+        kind = "roll" if fwd_idx == 0 else "overwrite"
+
+        if "shape" not in g:
+            # One-time static buffer setup on first steady forward.
+            for entry in st["kv_cache"]:
+                entry["freeze_scales"] = True
+            f = latent_in.shape[2] // model.patch_size[0]
+            h = latent_in.shape[3] // model.patch_size[1]
+            w = latent_in.shape[4] // model.patch_size[2]
+            cos, sin = model._compute_rope(f, h, w, start_index,
+                                           latent_in.device)
+            g["rope_cos"] = cos.clone()
+            g["rope_sin"] = sin.clone()
+            model._static_rope = (g["rope_cos"], g["rope_sin"])
+            g["latent"] = latent_in.clone()
+            g["t"] = t_tensor.clone()
+            g["y"] = current_y.clone()
+            g["plucker_buf"] = (c2ws.clone() if use_plucker else
+                                torch.zeros_like(c2ws) if c2ws is not None
+                                else None)
+            g["shape"] = (f, h, w)
+            g["plucker"] = use_plucker
+
+        if g.get("plucker") != use_plucker:
+            # Control-channel presence changed; graphs are invalid.
+            g.pop("roll", None)
+            g.pop("overwrite", None)
+            g["plucker_buf"] = c2ws.clone() if use_plucker else None
+            g["plucker"] = use_plucker
+
+        # Refresh static inputs (RoPE table advances with start_frame).
+        f, h, w = g["shape"]
+        cos, sin = model._compute_rope(f, h, w, start_index,
+                                       latent_in.device)
+        g["rope_cos"].copy_(cos)
+        g["rope_sin"].copy_(sin)
+        g["latent"].copy_(latent_in)
+        g["t"].copy_(t_tensor)
+        g["y"].copy_(current_y)
+        if use_plucker:
+            g["plucker_buf"].copy_(c2ws)
+
+        # Python-side cache positions the baked branch relies on. The
+        # roll graph must see "cache full, new chunk beyond global
+        # end"; the overwrite graph must see "current chunk already at
+        # global end".
+        cur_start_tok = start_index * self.frame_seq_length
+        cur_end_tok = cur_start_tok + chunk_tokens
+        for entry in st["kv_cache"]:
+            if kind == "roll":
+                entry["py_global_end"] = cur_start_tok
+                entry["py_local_end"] = window_tokens
+            else:
+                entry["py_global_end"] = cur_end_tok
+                entry["py_local_end"] = window_tokens
+
+        if kind not in g:
+            def run():
+                return self.transformer(
+                    g["latent"],
+                    st["prompt_embeds"],
+                    g["t"],
+                    kv_cache=st["kv_cache"],
+                    crossattn_cache=st["crossattn_cache"],
+                    current_start=cur_start_tok,
+                    start_frame=start_index,
+                    y=g["y"],
+                    max_attention_size=window_tokens,
+                    c2ws_plucker_emb=(g["plucker_buf"]
+                                      if use_plucker else None),
+                )
+
+            # Eager warmup with the EXACT static buffers and int args
+            # before capture: torch.compile guards specialize on the
+            # new current_start here, so no inductor compilation (with
+            # its unpinned host-to-device constant copies) can fire
+            # inside capture. Side effect: this chunk's KV write and
+            # roll run twice; in the steady rolled state the second
+            # write overwrites the first identically, and the extra
+            # roll evicts 3 context frames once (transient, invisible).
+            run()
+            torch.cuda.synchronize()
+            # Restore python positions consumed by the warmup run.
+            for entry in st["kv_cache"]:
+                if kind == "roll":
+                    entry["py_global_end"] = cur_start_tok
+                    entry["py_local_end"] = window_tokens
+                else:
+                    entry["py_global_end"] = cur_end_tok
+                    entry["py_local_end"] = window_tokens
+            graph = torch.cuda.CUDAGraph()
+            try:
+                with torch.cuda.graph(graph):
+                    out = run()
+            except Exception:
+                import traceback
+                logger.error("[LingBot-Fast] CUDA graph capture failed:\n%s",
+                             traceback.format_exc())
+                raise
+            g[kind] = graph
+            g[f"{kind}_out"] = out
+            logger.info(
+                "[LingBot-Fast] CUDA graph '%s' captured "
+                "(plucker=%s)", kind, use_plucker)
+            return out
+
+        g[kind].replay()
+        return g[f"{kind}_out"]
+
     def _plucker_chunk(self, poses_pix: torch.Tensor,
                        st: dict) -> torch.Tensor:
         """Build the per-chunk camera Plucker embedding.
@@ -571,18 +732,10 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
                     (latent_model_input.shape[0], 1),
                     device=latent_model_input.device,
                     dtype=torch.long)
-                pred_noise_btchw = self.transformer(
-                    latent_model_input,
-                    st["prompt_embeds"],
-                    t_expanded_noise,
-                    kv_cache=st["kv_cache"],
-                    crossattn_cache=st["crossattn_cache"],
-                    current_start=start_index * self.frame_seq_length,
-                    start_frame=start_index,
-                    y=current_y,
-                    max_attention_size=st["max_attention_size"],
-                    c2ws_plucker_emb=c2ws_plucker_emb,
-                ).permute(0, 2, 1, 3, 4)
+                pred_noise_btchw = self._transformer_step(
+                    st, latent_model_input, t_expanded_noise,
+                    start_index, current_y, c2ws_plucker_emb,
+                    fwd_idx=i).permute(0, 2, 1, 3, 4)
 
             pred_video_btchw = pred_noise_to_pred_video(
                 pred_noise=pred_noise_btchw.flatten(0, 1),
@@ -627,18 +780,10 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
             set_forward_context(current_timestep=0,
                                 attn_metadata=None,
                                 forward_batch=batch):
-            self.transformer(
-                current_latents.to(target_dtype),
-                st["prompt_embeds"],
-                t_context,
-                kv_cache=st["kv_cache"],
-                crossattn_cache=st["crossattn_cache"],
-                current_start=start_index * self.frame_seq_length,
-                start_frame=start_index,
-                y=current_y,
-                max_attention_size=st["max_attention_size"],
-                c2ws_plucker_emb=c2ws_plucker_emb,
-            )
+            self._transformer_step(
+                st, current_latents.to(target_dtype), t_context,
+                start_index, current_y, c2ws_plucker_emb,
+                fwd_idx=len(timesteps))
 
         st["start_index"] = start_index + current_num_frames
         st["block_idx"] += 1
