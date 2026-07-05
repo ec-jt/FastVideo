@@ -442,6 +442,28 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
             self.num_frames_per_block, h, w)
         return batch
 
+    @staticmethod
+    def _device_randn(st: dict, shape, dtype, device) -> torch.Tensor:
+        """Noise sampled ON DEVICE with a session-persistent generator.
+
+        The original path (torch.randn on CPU with the batch generator
+        + .to(device)) costs a host-side generation and an unpinned
+        H2D upload per DMD step, and cannot run under CUDA graph
+        capture. A per-session CUDA generator (seeded once from the
+        batch generator for determinism) keeps noise on device.
+        """
+        gen = st.get("_cuda_gen")
+        if gen is None or gen.device != torch.device(device):
+            gen = torch.Generator(device=device)
+            base = st["batch"].generator
+            if isinstance(base, list):
+                base = base[0]
+            gen.manual_seed(
+                int(base.initial_seed()) if base is not None else 42)
+            st["_cuda_gen"] = gen
+        return torch.randn(shape, dtype=dtype, device=device,
+                           generator=gen)
+
     def _transformer_step(self, st: dict, latent_in: torch.Tensor,
                           t_tensor: torch.Tensor, start_index: int,
                           current_y: torch.Tensor,
@@ -525,11 +547,16 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
             g["plucker"] = use_plucker
 
         # Refresh static inputs (RoPE table advances with start_frame).
+        # The fp64 table is generated on CPU - cache it per chunk so
+        # the 5 forwards of a chunk do not regenerate + re-upload the
+        # same table (measured ~10ms/build, 5x/chunk).
         f, h, w = g["shape"]
-        cos, sin = model._compute_rope(f, h, w, start_index,
-                                       latent_in.device)
-        g["rope_cos"].copy_(cos)
-        g["rope_sin"].copy_(sin)
+        if g.get("rope_start") != start_index:
+            cos, sin = model._compute_rope(f, h, w, start_index,
+                                           latent_in.device)
+            g["rope_cos"].copy_(cos)
+            g["rope_sin"].copy_(sin)
+            g["rope_start"] = start_index
         g["latent"].copy_(latent_in)
         g["t"].copy_(t_tensor)
         g["y"].copy_(current_y)
@@ -700,13 +727,10 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
             # y slice (mask channels are zero and the VAE conditioning
             # encodes the zero-padded video for every frame > 0, so the
             # tail slice is the correct steady-state conditioning).
-            gen = (batch.generator[0] if isinstance(
-                batch.generator, list) else batch.generator)
-            current_latents = torch.randn(
-                (b, latents.shape[1], current_num_frames,
-                 latents.shape[3], latents.shape[4]),
-                dtype=latents.dtype,
-                generator=gen).to(latents.device)
+            current_latents = self._device_randn(
+                st, (b, latents.shape[1], current_num_frames,
+                     latents.shape[3], latents.shape[4]),
+                latents.dtype, latents.device)
             current_y = y[:, :, enc - current_num_frames:enc]
 
         c2ws_plucker_emb = None
@@ -748,12 +772,9 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
                 next_timestep = timesteps[i + 1] * torch.ones(
                     [1], dtype=torch.long,
                     device=pred_video_btchw.device)
-                noise = torch.randn(
-                    video_raw_latent_shape,
-                    dtype=pred_video_btchw.dtype,
-                    generator=(batch.generator[0] if isinstance(
-                        batch.generator, list) else
-                               batch.generator)).to(latents.device)
+                noise = self._device_randn(st, video_raw_latent_shape,
+                                           pred_video_btchw.dtype,
+                                           latents.device)
                 noise_latents_btchw = self.scheduler.add_noise(
                     pred_video_btchw.flatten(0, 1),
                     noise.flatten(0, 1), next_timestep).unflatten(
