@@ -464,6 +464,215 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
         return torch.randn(shape, dtype=dtype, device=device,
                            generator=gen)
 
+    def _step_body(self, st: dict, current_latents: torch.Tensor,
+                   current_y: torch.Tensor,
+                   c2ws: torch.Tensor | None, start_index: int,
+                   noise_bufs: list[torch.Tensor],
+                   use_graph_positions: bool) -> torch.Tensor:
+        """The full denoise body for ONE chunk: 4 DMD forwards with
+        re-noising between them, then the t=0 cache refresh forward.
+        Returns the clean chunk latents [B, C, F, H, W].
+
+        Pure device work end to end (noise comes from noise_bufs, all
+        scheduler math is device tensor ops), so the entire body is
+        CUDA-graph capturable. use_graph_positions: maintain the
+        python-int cache positions per forward (roll on the first
+        forward, overwrite after) as the attention layers expect in
+        graph mode.
+        """
+        batch = st["batch"]
+        timesteps = st["timesteps"]
+        target_dtype = st["target_dtype"]
+        autocast_enabled = st["autocast_enabled"]
+        chunk_tokens = self.frame_seq_length * self.num_frames_per_block
+        window_tokens = st["max_attention_size"]
+        cur_start_tok = start_index * self.frame_seq_length
+
+        def set_positions(rolling: bool):
+            if not use_graph_positions:
+                return
+            for entry in st["kv_cache"]:
+                entry["py_global_end"] = (cur_start_tok if rolling else
+                                          cur_start_tok + chunk_tokens)
+                entry["py_local_end"] = window_tokens
+
+        noise_latents_btchw = current_latents.permute(0, 2, 1, 3, 4)
+        for i, t_cur in enumerate(timesteps):
+            noise_latents = noise_latents_btchw.clone()
+            latent_model_input = current_latents.to(target_dtype)
+            t_expand = t_cur.repeat(latent_model_input.shape[0])
+            set_positions(rolling=(i == 0))
+
+            with torch.autocast(device_type="cuda",
+                                dtype=target_dtype,
+                                enabled=autocast_enabled), \
+                set_forward_context(current_timestep=i,
+                                    attn_metadata=None,
+                                    forward_batch=batch):
+                t_expanded_noise = t_cur * torch.ones(
+                    (latent_model_input.shape[0], 1),
+                    device=latent_model_input.device,
+                    dtype=torch.long)
+                pred_noise_btchw = self.transformer(
+                    latent_model_input,
+                    st["prompt_embeds"],
+                    t_expanded_noise,
+                    kv_cache=st["kv_cache"],
+                    crossattn_cache=st["crossattn_cache"],
+                    current_start=cur_start_tok,
+                    start_frame=start_index,
+                    y=current_y,
+                    max_attention_size=window_tokens,
+                    c2ws_plucker_emb=c2ws,
+                ).permute(0, 2, 1, 3, 4)
+
+            pred_video_btchw = pred_noise_to_pred_video(
+                pred_noise=pred_noise_btchw.flatten(0, 1),
+                noise_input_latent=noise_latents.flatten(0, 1),
+                timestep=t_expand,
+                scheduler=self.scheduler).unflatten(
+                    0, pred_noise_btchw.shape[:2])
+
+            if i < len(timesteps) - 1:
+                next_timestep = timesteps[i + 1] * torch.ones(
+                    [1], dtype=torch.long,
+                    device=pred_video_btchw.device)
+                noise_latents_btchw = self.scheduler.add_noise(
+                    pred_video_btchw.flatten(0, 1),
+                    noise_bufs[i].flatten(0, 1),
+                    next_timestep).unflatten(
+                        0, pred_video_btchw.shape[:2])
+                current_latents = noise_latents_btchw.permute(
+                    0, 2, 1, 3, 4)
+            else:
+                current_latents = pred_video_btchw.permute(0, 2, 1, 3, 4)
+
+        # t=0 cache refresh forward with the clean chunk.
+        context_noise = getattr(st["fastvideo_args"].pipeline_config,
+                                "context_noise", 0)
+        t_context = torch.ones(
+            [current_latents.shape[0], 1],
+            device=current_latents.device,
+            dtype=torch.long) * int(context_noise)
+        set_positions(rolling=False)
+        with torch.autocast(device_type="cuda",
+                            dtype=target_dtype,
+                            enabled=autocast_enabled), \
+            set_forward_context(current_timestep=0,
+                                attn_metadata=None,
+                                forward_batch=batch):
+            self.transformer(
+                current_latents.to(target_dtype),
+                st["prompt_embeds"],
+                t_context,
+                kv_cache=st["kv_cache"],
+                crossattn_cache=st["crossattn_cache"],
+                current_start=cur_start_tok,
+                start_frame=start_index,
+                y=current_y,
+                max_attention_size=window_tokens,
+                c2ws_plucker_emb=c2ws,
+            )
+        return current_latents
+
+    def _try_step_graph(self, st: dict, current_latents: torch.Tensor,
+                        current_y: torch.Tensor,
+                        c2ws: torch.Tensor | None,
+                        start_index: int) -> torch.Tensor | None:
+        """Whole-step CUDA graph: all 5 forwards + scheduler math in
+        ONE graph (LINGBOT_STEP_GRAPH=true, unbounded sessions at
+        steady state). Noise is pre-filled into static buffers before
+        each replay so replays get fresh randomness; the RoPE table is
+        refreshed per chunk. Returns clean chunk latents, or None if
+        the whole-step path is not applicable (caller falls back to
+        the per-forward path).
+        """
+        if os.environ.get("LINGBOT_STEP_GRAPH",
+                          "false").lower() != "true":
+            return None
+        chunk_tokens = self.frame_seq_length * self.num_frames_per_block
+        window_tokens = st["max_attention_size"]
+        steady = (st.get("unbounded", False)
+                  and st["block_idx"] * chunk_tokens >= window_tokens)
+        if not steady:
+            return None
+
+        model = self.transformer
+        g = st.setdefault("_step_graph", {})
+        use_plucker = c2ws is not None
+        n_noise = len(st["timesteps"]) - 1
+
+        if g.get("plucker") not in (None, use_plucker):
+            g.clear()  # control-channel presence changed; recapture
+
+        if "graph" not in g:
+            for entry in st["kv_cache"]:
+                entry["freeze_scales"] = True
+            f = current_latents.shape[2] // model.patch_size[0]
+            h = current_latents.shape[3] // model.patch_size[1]
+            w = current_latents.shape[4] // model.patch_size[2]
+            cos, sin = model._compute_rope(f, h, w, start_index,
+                                           current_latents.device)
+            g["rope_cos"] = cos.clone()
+            g["rope_sin"] = sin.clone()
+            model._static_rope = (g["rope_cos"], g["rope_sin"])
+            g["shape"] = (f, h, w)
+            g["in"] = current_latents.clone()
+            g["y"] = current_y.clone()
+            g["plucker_buf"] = c2ws.clone() if use_plucker else None
+            # Noise is consumed in BTCHW layout (matches the permuted
+            # pred_video in _step_body / the per-forward path).
+            b_, c_, f_, h_, w_ = current_latents.shape
+            noise_shape = (b_, f_, c_, h_, w_)
+            g["noise"] = [
+                self._device_randn(st, noise_shape,
+                                   current_latents.dtype,
+                                   current_latents.device)
+                for _ in range(n_noise)
+            ]
+            g["plucker"] = use_plucker
+
+            def run():
+                return self._step_body(
+                    st, g["in"], g["y"],
+                    g["plucker_buf"] if use_plucker else None,
+                    start_index, g["noise"],
+                    use_graph_positions=True)
+
+            run()  # eager warmup with exact buffers/args
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            try:
+                with torch.cuda.graph(graph):
+                    g["out"] = run()
+            except Exception:
+                import traceback
+                logger.error(
+                    "[LingBot-Fast] step-graph capture failed:\n%s",
+                    traceback.format_exc())
+                raise
+            g["graph"] = graph
+            logger.info(
+                "[LingBot-Fast] whole-step CUDA graph captured "
+                "(plucker=%s)", use_plucker)
+            return g["out"]
+
+        # Replay: refresh RoPE (start_frame advances), inputs, noise.
+        f, h, w = g["shape"]
+        cos, sin = model._compute_rope(f, h, w, start_index,
+                                       current_latents.device)
+        g["rope_cos"].copy_(cos)
+        g["rope_sin"].copy_(sin)
+        g["in"].copy_(current_latents)
+        g["y"].copy_(current_y)
+        if use_plucker:
+            g["plucker_buf"].copy_(c2ws)
+        for buf in g["noise"]:
+            buf.copy_(
+                self._device_randn(st, buf.shape, buf.dtype, buf.device))
+        g["graph"].replay()
+        return g["out"]
+
     def _transformer_step(self, st: dict, latent_in: torch.Tensor,
                           t_tensor: torch.Tensor, start_index: int,
                           current_y: torch.Tensor,
@@ -737,6 +946,20 @@ class LingBotCausalDMDDenoisingStage(CausalDMDDenosingStage):
         if mouse_action is not None:
             c2ws_plucker_emb = self._plucker_chunk(mouse_action,
                                                    st).to(latents.device)
+
+        # Whole-step CUDA graph fast path (LINGBOT_STEP_GRAPH).
+        graph_out = self._try_step_graph(st, current_latents, current_y,
+                                         c2ws_plucker_emb, start_index)
+        if graph_out is not None:
+            current_latents = graph_out
+            if in_range:
+                latents[:, :, start_index:start_index +
+                        current_num_frames] = current_latents
+            st["last_chunk_latents"] = current_latents
+            st["start_index"] = start_index + current_num_frames
+            st["block_idx"] += 1
+            batch.latents = latents
+            return batch
 
         noise_latents_btchw = current_latents.permute(0, 2, 1, 3, 4)
         video_raw_latent_shape = noise_latents_btchw.shape

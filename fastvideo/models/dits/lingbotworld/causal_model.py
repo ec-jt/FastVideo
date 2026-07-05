@@ -147,8 +147,10 @@ class CausalLingBotSelfAttention(nn.Module):
         # .item() reads, tensor position updates are skipped (baked
         # constants are stable in the steady rolled state), and fp8
         # scale recalibration is frozen (kv_cache["freeze_scales"]).
-        graph_mode = os.environ.get("LINGBOT_CUDA_GRAPH",
-                                    "false").lower() == "true"
+        graph_mode = (os.environ.get("LINGBOT_CUDA_GRAPH",
+                                     "false").lower() == "true"
+                      or os.environ.get("LINGBOT_STEP_GRAPH",
+                                        "false").lower() == "true")
         fp8_kv = kv_cache["k"].dtype == torch.float8_e4m3fn
         if fp8_kv and kv_cache.get("freeze_scales"):
             k_scale = kv_cache["k_scale"].view(1, 1, -1, 1)
